@@ -1,0 +1,224 @@
+---
+description: "Next.js 15 routing rules for App Router. Covers file conventions, metadata API, dynamic routes, route handlers, loading/error states, and generateStaticParams."
+globs: ["**/page.tsx", "**/page.ts", "**/layout.tsx", "**/layout.ts", "**/route.ts", "**/route.tsx", "**/loading.tsx", "**/error.tsx", "**/not-found.tsx"]
+---
+
+# Next.js 15 Routing Rules
+
+## File Convention Hierarchy
+
+Files in each route segment are rendered in this order:
+
+```
+layout.tsx        (wraps everything, persists across navigation)
+  template.tsx    (re-mounts on navigation)
+    error.tsx     (error boundary - does NOT catch layout errors)
+      loading.tsx (Suspense boundary)
+        not-found.tsx
+        page.tsx
+```
+
+**Critical:** `error.tsx` catches errors from `page.tsx` and below, NOT from `layout.tsx` in the same segment. To catch layout errors, place `error.tsx` in the parent segment or use `global-error.tsx`.
+
+## Route Handlers
+
+```typescript
+// app/api/users/[id]/route.ts
+
+export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params; // Must await in 15!
+  const user = await db.user.findUnique({ where: { id } });
+
+  if (!user) {
+    return Response.json({ error: 'Not found' }, { status: 404 });
+  }
+
+  return Response.json(user);
+}
+
+export async function POST(request: Request) {
+  const body = await request.json();
+  const user = await db.user.create({ data: body });
+  return Response.json(user, { status: 201 });
+}
+
+export async function DELETE(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params;
+  await db.user.delete({ where: { id } });
+  return Response.json({ success: true });
+}
+```
+
+**Query parameters:**
+```typescript
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const page = searchParams.get('page') || '1';
+  const limit = searchParams.get('limit') || '10';
+
+  const users = await db.user.findMany({
+    skip: (parseInt(page) - 1) * parseInt(limit),
+    take: parseInt(limit),
+  });
+
+  return Response.json(users);
+}
+```
+
+## Metadata API
+
+**Static metadata:**
+```typescript
+import type { Metadata } from 'next';
+
+export const metadata: Metadata = {
+  title: 'My App',
+  description: 'Welcome to my application',
+  openGraph: {
+    title: 'My App',
+    description: 'Welcome to my application',
+    images: [{ url: '/og.png', width: 1200, height: 630 }],
+  },
+};
+
+export default function Page() {
+  return <h1>Home</h1>;
+}
+```
+
+**Dynamic metadata (must await params):**
+```typescript
+import type { Metadata } from 'next';
+
+export async function generateMetadata({
+  params,
+}: {
+  params: Promise<{ slug: string }>;
+}): Promise<Metadata> {
+  const { slug } = await params; // Must await in 15!
+  const post = await db.post.findUnique({ where: { slug } });
+
+  return {
+    title: post?.title || 'Not Found',
+    description: post?.excerpt,
+    openGraph: {
+      images: post?.imageUrl ? [{ url: post.imageUrl }] : [],
+    },
+  };
+}
+```
+
+## Dynamic Routes
+
+```typescript
+// [param] - single segment: /users/123
+// [...param] - catch-all: /docs/a/b/c (does NOT match /docs)
+// [[...param]] - optional catch-all: matches /docs AND /docs/a/b/c
+
+// app/users/[id]/page.tsx
+export default async function UserPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+  return <h1>User {id}</h1>;
+}
+```
+
+## generateStaticParams (Pre-render at Build Time)
+
+```typescript
+// app/posts/[slug]/page.tsx
+export async function generateStaticParams() {
+  const posts = await db.post.findMany({ select: { slug: true } });
+  return posts.map(post => ({ slug: post.slug }));
+}
+
+export default async function PostPage({
+  params,
+}: {
+  params: Promise<{ slug: string }>;
+}) {
+  const { slug } = await params;
+  const post = await db.post.findUnique({ where: { slug } });
+  return <article>{post?.content}</article>;
+}
+```
+
+Posts returned by `generateStaticParams` are pre-rendered at build time. Others are rendered on-demand and cached.
+
+## Loading and Error States
+
+```typescript
+// app/dashboard/loading.tsx
+export default function Loading() {
+  return <div className="animate-pulse">Loading dashboard...</div>;
+}
+
+// app/dashboard/error.tsx
+'use client'; // error.tsx MUST be a Client Component
+
+export default function Error({
+  error,
+  reset,
+}: {
+  error: Error & { digest?: string };
+  reset: () => void;
+}) {
+  return (
+    <div>
+      <h2>Something went wrong</h2>
+      <button onClick={() => reset()}>Try again</button>
+    </div>
+  );
+}
+
+// app/not-found.tsx
+export default function NotFound() {
+  return <h1>404 - Page Not Found</h1>;
+}
+```
+
+## Dynamic vs Static Rendering
+
+A route is **static** (pre-rendered at build time) unless it uses dynamic functions:
+- `cookies()` or `headers()`
+- `searchParams` prop
+- `params` in certain contexts
+- `connection()` or `draftMode()`
+
+To force behavior:
+```typescript
+// Force static
+export const dynamic = 'force-static';
+
+// Force dynamic
+export const dynamic = 'force-dynamic';
+
+// Revalidate every N seconds (ISR)
+export const revalidate = 3600;
+```
+
+## Next.js Form Component (15+)
+
+For forms that navigate to a new page:
+```typescript
+import Form from 'next/form';
+
+export default function SearchForm() {
+  return (
+    <Form action="/search">
+      <input name="q" placeholder="Search..." />
+      <button type="submit">Search</button>
+    </Form>
+  );
+}
+// Prefetches layout/loading, uses client-side navigation
+```

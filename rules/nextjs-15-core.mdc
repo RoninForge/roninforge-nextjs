@@ -1,0 +1,236 @@
+---
+description: "Core Next.js 15 rules. Enforces async request APIs, correct caching defaults, Server Component patterns, and prevents Pages Router hallucinations."
+alwaysApply: true
+---
+
+# Next.js 15 Core Rules
+
+You are working with **Next.js 15** and the **App Router**. Your training data likely contains Next.js 14 or Pages Router patterns. Follow these rules exactly.
+
+## Async Request APIs (Breaking Change in 15)
+
+`cookies()`, `headers()`, `params`, and `searchParams` are now **async** and must be awaited:
+
+```typescript
+// CORRECT - Next.js 15
+import { cookies, headers } from 'next/headers';
+
+export default async function Page() {
+  const cookieStore = await cookies();
+  const token = cookieStore.get('auth');
+
+  const headersList = await headers();
+  const userAgent = headersList.get('user-agent');
+
+  return <div>{token?.value}</div>;
+}
+
+// WRONG - Next.js 14 pattern, crashes in 15
+export default function Page() {
+  const cookieStore = cookies();        // ERROR: must await
+  const token = cookieStore.get('auth'); // crashes
+}
+```
+
+**params is a Promise in dynamic routes:**
+```typescript
+// CORRECT
+export default async function UserPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+  return <h1>User {id}</h1>;
+}
+
+// WRONG - params is not a sync object in 15
+export default function UserPage({ params }: { params: { id: string } }) {
+  return <h1>User {params.id}</h1>; // crashes
+}
+```
+
+**searchParams is a Promise:**
+```typescript
+// CORRECT
+export default async function SearchPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ q?: string }>;
+}) {
+  const { q } = await searchParams;
+  return <div>Results for: {q}</div>;
+}
+```
+
+## Caching Defaults Changed (Breaking Change in 15)
+
+**`fetch()` is NOT cached by default in Next.js 15.** You must opt in explicitly:
+
+```typescript
+// NOT cached (default in 15)
+const data = await fetch('https://api.example.com/data');
+
+// Cached for 1 hour (explicit opt-in)
+const data = await fetch('https://api.example.com/data', {
+  next: { revalidate: 3600 },
+});
+
+// Cached forever until manually revalidated
+const data = await fetch('https://api.example.com/data', {
+  cache: 'force-cache',
+});
+```
+
+**GET Route Handlers are NOT cached by default:**
+```typescript
+// NOT cached (default in 15)
+export async function GET() {
+  const data = await fetchData();
+  return Response.json(data); // Fresh every request
+}
+
+// To cache, opt in:
+export const revalidate = 3600; // Cache for 1 hour
+export async function GET() {
+  const data = await fetchData();
+  return Response.json(data);
+}
+```
+
+## Server Components Are the Default
+
+Every component in the `app/` directory is a Server Component by default. Use `'use client'` only when you need browser APIs, React state, or event handlers:
+
+```typescript
+// app/page.tsx - Server Component (default, no directive needed)
+export default async function Page() {
+  // Can use async/await
+  const data = await fetch('https://api.example.com/data');
+
+  // Can access server-only resources (DB, filesystem, secrets)
+  const secret = process.env.API_SECRET;
+
+  return <div>{JSON.stringify(data)}</div>;
+}
+```
+
+```typescript
+// app/counter.tsx - Client Component (needs 'use client')
+'use client'; // Must be at the TOP of the file, before any imports
+
+import { useState } from 'react';
+
+export default function Counter() {
+  const [count, setCount] = useState(0);
+  return <button onClick={() => setCount(count + 1)}>Count: {count}</button>;
+}
+```
+
+**"use client" boundary rules:**
+- Place it as LOW in the tree as possible (not in layout.tsx or page.tsx unless necessary)
+- It marks the boundary: everything imported by a `'use client'` file becomes client code
+- Server Components CAN be passed as `children` to Client Components
+
+## Server Actions for Mutations
+
+Use Server Actions (not Route Handlers) for data mutations:
+
+```typescript
+// app/actions.ts
+'use server';
+
+import { revalidatePath } from 'next/cache';
+
+export async function createPost(formData: FormData) {
+  const title = formData.get('title') as string;
+
+  // Server-only: DB access, secrets, etc.
+  await db.post.create({ data: { title } });
+
+  // Always revalidate after mutations
+  revalidatePath('/posts');
+}
+```
+
+```typescript
+// app/form.tsx
+'use client';
+
+import { useActionState } from 'react'; // React 19, NOT useFormState
+import { createPost } from './actions';
+
+export function PostForm() {
+  const [state, formAction, isPending] = useActionState(createPost, null);
+
+  return (
+    <form action={formAction}>
+      <input name="title" required />
+      <button disabled={isPending}>
+        {isPending ? 'Creating...' : 'Create'}
+      </button>
+      {state?.error && <p>{state.error}</p>}
+    </form>
+  );
+}
+```
+
+**Important:** `useFormState` is deprecated in React 19. Use `useActionState` which also returns `isPending`.
+
+## Do Not Fetch Your Own Route Handlers from Server Components
+
+```typescript
+// WRONG - unnecessary network hop
+export default async function Page() {
+  const res = await fetch('http://localhost:3000/api/users');
+  const users = await res.json();
+  return <UserList users={users} />;
+}
+
+// CORRECT - access data directly
+export default async function Page() {
+  const users = await db.user.findMany();
+  return <UserList users={users} />;
+}
+```
+
+Route Handlers are for external clients (mobile apps, third-party integrations). Server Components should access data directly.
+
+## redirect() and notFound() Throw Internally
+
+Do not wrap them in try/catch:
+
+```typescript
+// WRONG - redirect throws, gets caught
+try {
+  if (!user) {
+    redirect('/login'); // Throws internally!
+  }
+} catch (e) {
+  // redirect exception gets caught here
+}
+
+// CORRECT - let them throw
+if (!user) {
+  redirect('/login');
+}
+
+// After redirect, code is unreachable
+```
+
+## after() for Post-Response Work (15.1+)
+
+Run code after the response is sent without blocking the user:
+
+```typescript
+import { after } from 'next/server';
+
+export default function Page() {
+  after(() => {
+    // Runs after response is sent
+    analytics.track('page_viewed');
+  });
+
+  return <h1>Page</h1>;
+}
+```

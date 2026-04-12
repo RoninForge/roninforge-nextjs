@@ -1,0 +1,273 @@
+---
+description: "Next.js 15 anti-pattern detection. Prevents Pages Router patterns in App Router projects, 'use client' misplacement, stale caching assumptions, and common Server Component mistakes."
+alwaysApply: true
+---
+
+# Next.js 15 Anti-Patterns
+
+These are the patterns AI models generate most frequently when writing Next.js 15 code. Every one of them causes real problems.
+
+## Anti-Pattern 1: Pages Router in App Router (Most Common AI Mistake)
+
+```typescript
+// WRONG - Pages Router patterns do not exist in App Router
+export async function getServerSideProps() { ... }
+export async function getStaticProps() { ... }
+export async function getStaticPaths() { ... }
+import { useRouter } from 'next/router';
+
+// CORRECT - App Router equivalents
+// getServerSideProps -> async Server Component
+export default async function Page() {
+  const data = await fetch('...');
+  return <div>{data}</div>;
+}
+
+// getStaticProps + getStaticPaths -> generateStaticParams
+export async function generateStaticParams() {
+  const posts = await fetch('https://api.example.com/posts').then(r => r.json());
+  return posts.map((post: any) => ({ slug: post.slug }));
+}
+
+// useRouter from 'next/router' -> useRouter from 'next/navigation'
+import { useRouter } from 'next/navigation'; // NOT 'next/router'
+```
+
+## Anti-Pattern 2: "use client" on Layout or Page
+
+```typescript
+// WRONG - makes entire subtree client-rendered
+'use client';
+
+export default function RootLayout({ children }) {
+  return <html><body>{children}</body></html>;
+}
+
+// WRONG - page doesn't need 'use client' for data fetching
+'use client';
+
+export default function Page() {
+  const [data, setData] = useState(null);
+  useEffect(() => {
+    fetch('/api/data').then(r => r.json()).then(setData);
+  }, []);
+  return <div>{data}</div>;
+}
+
+// CORRECT - Server Component fetches data directly
+export default async function Page() {
+  const data = await fetch('https://api.example.com/data').then(r => r.json());
+  return <div>{JSON.stringify(data)}</div>;
+}
+```
+
+**Rule:** Only add `'use client'` to the smallest component that needs browser APIs, state, or event handlers. Never on layouts or pages unless they genuinely need client interactivity.
+
+## Anti-Pattern 3: useEffect + fetch for Server Data
+
+```typescript
+// WRONG - client-side fetch for server-available data
+'use client';
+import { useState, useEffect } from 'react';
+
+export default function ProductList() {
+  const [products, setProducts] = useState([]);
+  useEffect(() => {
+    fetch('/api/products').then(r => r.json()).then(setProducts);
+  }, []);
+  return <ul>{products.map(p => <li key={p.id}>{p.name}</li>)}</ul>;
+}
+
+// CORRECT - Server Component with direct data access
+export default async function ProductList() {
+  const products = await db.product.findMany();
+  return <ul>{products.map(p => <li key={p.id}>{p.name}</li>)}</ul>;
+}
+```
+
+This eliminates the loading spinner, the client-server round trip, and the layout shift.
+
+## Anti-Pattern 4: Sync cookies/headers/params (14 Pattern)
+
+```typescript
+// WRONG - crashes in Next.js 15
+import { cookies } from 'next/headers';
+
+export default function Page() {
+  const cookieStore = cookies();      // Must await!
+  const token = cookieStore.get('auth');
+}
+
+// WRONG - params is a Promise in 15
+export default function UserPage({ params }: { params: { id: string } }) {
+  return <h1>{params.id}</h1>;        // Must await params!
+}
+
+// WRONG - searchParams is a Promise in 15
+export default function SearchPage({ searchParams }: { searchParams: { q: string } }) {
+  return <div>{searchParams.q}</div>; // Must await!
+}
+```
+
+All three must be awaited. See the core rules for correct syntax.
+
+## Anti-Pattern 5: Assuming fetch Is Cached
+
+```typescript
+// WRONG - assuming this is cached (it was in 14, not in 15)
+export default async function Page() {
+  const data = await fetch('https://api.example.com/data');
+  // This is NOT cached. It fetches fresh every request.
+}
+
+// CORRECT - explicitly opt into caching
+export default async function Page() {
+  const data = await fetch('https://api.example.com/data', {
+    next: { revalidate: 3600 }, // Cache 1 hour
+  });
+}
+```
+
+## Anti-Pattern 6: useFormState (Deprecated in React 19)
+
+```typescript
+// WRONG - deprecated
+import { useFormState } from 'react-dom';
+const [state, formAction] = useFormState(serverAction, initialState);
+
+// CORRECT - React 19
+import { useActionState } from 'react';
+const [state, formAction, isPending] = useActionState(serverAction, initialState);
+```
+
+`useActionState` also returns `isPending`, eliminating the need for a separate `useFormStatus` call in many cases.
+
+## Anti-Pattern 7: Mutation Without Revalidation
+
+```typescript
+// WRONG - data stays stale after mutation
+'use server';
+export async function updateUser(id: string, data: any) {
+  await db.user.update({ where: { id }, data });
+  // Page still shows old data!
+}
+
+// CORRECT - revalidate after every mutation
+'use server';
+import { revalidatePath, revalidateTag } from 'next/cache';
+
+export async function updateUser(id: string, data: any) {
+  await db.user.update({ where: { id }, data });
+  revalidatePath(`/users/${id}`);
+  revalidateTag('users');
+}
+```
+
+## Anti-Pattern 8: Route Handler for Internal Data
+
+```typescript
+// WRONG - fetching your own API from Server Component
+// app/api/users/route.ts
+export async function GET() {
+  const users = await db.user.findMany();
+  return Response.json(users);
+}
+
+// app/page.tsx
+export default async function Page() {
+  const res = await fetch('http://localhost:3000/api/users'); // Unnecessary!
+  const users = await res.json();
+  return <UserList users={users} />;
+}
+
+// CORRECT - access data directly in Server Component
+export default async function Page() {
+  const users = await db.user.findMany();
+  return <UserList users={users} />;
+}
+```
+
+Route Handlers are for external clients only. Server Components access data directly.
+
+## Anti-Pattern 9: Server Action Without Authorization
+
+```typescript
+// WRONG - no auth check
+'use server';
+export async function deletePost(postId: string) {
+  await db.post.delete({ where: { id: postId } });
+}
+
+// CORRECT - always authorize
+'use server';
+import { cookies } from 'next/headers';
+
+export async function deletePost(postId: string) {
+  const cookieStore = await cookies();
+  const session = await getSession(cookieStore);
+  if (!session?.userId) {
+    throw new Error('Unauthorized');
+  }
+
+  const post = await db.post.findUnique({ where: { id: postId } });
+  if (post?.authorId !== session.userId) {
+    throw new Error('Forbidden');
+  }
+
+  await db.post.delete({ where: { id: postId } });
+  revalidatePath('/posts');
+}
+```
+
+Server Actions are public HTTP endpoints. Always validate and authorize.
+
+## Anti-Pattern 10: error.tsx Wrapping Layout
+
+```typescript
+// WRONG mental model:
+// error.tsx catches errors in layout.tsx (it doesn't!)
+
+// Correct hierarchy:
+// layout.tsx
+//   template.tsx
+//     error.tsx (catches errors in page.tsx, NOT layout.tsx)
+//       loading.tsx
+//         page.tsx
+
+// To catch layout errors, use error.tsx in the PARENT segment
+// or use global-error.tsx at the app root
+```
+
+## Anti-Pattern 11: Importing from 'next/router'
+
+```typescript
+// WRONG - Pages Router import
+import { useRouter } from 'next/router';
+
+// CORRECT - App Router import
+import { useRouter } from 'next/navigation';
+import { usePathname, useSearchParams } from 'next/navigation';
+```
+
+## Anti-Pattern 12: Context in Server Components
+
+```typescript
+// WRONG - useContext doesn't work in Server Components
+import { useContext } from 'react';
+
+export default function ServerPage() {
+  const theme = useContext(ThemeContext); // ERROR
+}
+
+// CORRECT - pass data as props, or use a Client Component wrapper
+// Create a Client Component provider
+'use client';
+export function ThemeProvider({ children }) {
+  return <ThemeContext.Provider value={theme}>{children}</ThemeContext.Provider>;
+}
+
+// Use it in layout, pass Server Components as children
+export default function Layout({ children }) {
+  return <ThemeProvider>{children}</ThemeProvider>;
+}
+```
