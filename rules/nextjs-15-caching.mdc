@@ -45,8 +45,9 @@ const data = await fetch('https://api.example.com/posts', {
 });
 
 // Cached with tags (for targeted revalidation)
+// Note: tags alone do NOT enable caching in 15. Pair with revalidate or force-cache.
 const data = await fetch('https://api.example.com/posts', {
-  next: { tags: ['posts'] },
+  next: { revalidate: 3600, tags: ['posts'] },
 });
 
 // Cached forever until manually revalidated
@@ -91,11 +92,9 @@ To configure (if you want 14 behavior):
 ```typescript
 // next.config.ts
 const nextConfig = {
-  experimental: {
-    staleTimes: {
-      dynamic: 30,
-      static: 180,
-    },
+  staleTimes: {
+    dynamic: 30,
+    static: 300, // 5 minutes, matches Next.js 14 default
   },
 };
 ```
@@ -121,12 +120,13 @@ export async function updatePost(id: string, data: any) {
 
 Tag data during fetch (in a Server Component):
 ```typescript
+// Tags must be paired with revalidate or force-cache to enter the Data Cache
 const posts = await fetch('https://api.example.com/posts', {
-  next: { tags: ['posts'] },
+  next: { revalidate: 3600, tags: ['posts'] },
 });
 
 const user = await fetch(`https://api.example.com/users/${id}`, {
-  next: { tags: ['users', `user-${id}`] },
+  next: { revalidate: 60, tags: ['users', `user-${id}`] },
 });
 ```
 
