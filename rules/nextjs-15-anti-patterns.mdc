@@ -231,8 +231,9 @@ Server Actions are public HTTP endpoints. Always validate and authorize.
 // layout.tsx
 //   template.tsx
 //     error.tsx (catches errors in page.tsx, NOT layout.tsx)
-//       loading.tsx
+//       loading.tsx (Suspense boundary)
 //         page.tsx
+// not-found.tsx renders at segment level when notFound() is called
 
 // To catch layout errors, use error.tsx in the PARENT segment
 // or use global-error.tsx at the app root

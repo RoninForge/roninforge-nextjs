@@ -15,13 +15,13 @@ Same fetch URL + options within a single server render are deduplicated automati
 ```typescript
 // Both calls result in only 1 actual HTTP request
 async function ProductPage() {
-  const product = await fetch('https://api.example.com/product/1');
-  return <ProductDetails product={product} />;
+  const product = await fetch('https://api.example.com/product/1').then(r => r.json());
+  return <ProductDetails />;
 }
 
-async function ProductDetails({ product }) {
-  // Same URL: memoized, no second request
-  const product = await fetch('https://api.example.com/product/1');
+async function ProductDetails() {
+  // Same URL + options: memoized, no second HTTP request
+  const product = await fetch('https://api.example.com/product/1').then(r => r.json());
   return <div>{product.name}</div>;
 }
 ```

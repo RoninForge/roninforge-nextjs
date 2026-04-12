@@ -218,7 +218,7 @@ if (!user) {
 // After redirect, code is unreachable
 ```
 
-## after() for Post-Response Work (15.1+)
+## after() for Post-Response Work (stable 15.1+, experimental in 15.0)
 
 Run code after the response is sent without blocking the user:
 

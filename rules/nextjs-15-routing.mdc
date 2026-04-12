@@ -14,8 +14,9 @@ layout.tsx        (wraps everything, persists across navigation)
   template.tsx    (re-mounts on navigation)
     error.tsx     (error boundary - does NOT catch layout errors)
       loading.tsx (Suspense boundary)
-        not-found.tsx
         page.tsx
+
+not-found.tsx     (rendered when notFound() is called, replaces page at segment level)
 ```
 
 **Critical:** `error.tsx` catches errors from `page.tsx` and below, NOT from `layout.tsx` in the same segment. To catch layout errors, place `error.tsx` in the parent segment or use `global-error.tsx`.
