@@ -119,8 +119,8 @@ export async function updatePost(id: string, data: any) {
 
 ### revalidateTag - Revalidate by Tag
 
+Tag data during fetch (in a Server Component):
 ```typescript
-// When fetching, tag the data
 const posts = await fetch('https://api.example.com/posts', {
   next: { tags: ['posts'] },
 });
@@ -128,9 +128,12 @@ const posts = await fetch('https://api.example.com/posts', {
 const user = await fetch(`https://api.example.com/users/${id}`, {
   next: { tags: ['users', `user-${id}`] },
 });
+```
 
-// When mutating, revalidate by tag
+Then revalidate by tag in a Server Action:
+```typescript
 'use server';
+
 import { revalidateTag } from 'next/cache';
 
 export async function createPost(data: any) {
