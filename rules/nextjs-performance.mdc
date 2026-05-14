@@ -1,0 +1,442 @@
+---
+description: "Next.js 16 performance: next/image (priority, sizes, fill, placeholder='blur', quality coerced to images.qualities default [75], fetchPriority, remotePatterns over deprecated domains, localPatterns.search), next/font (variable fonts + CSS variable, display swap, subsets, self-hosted), next/dynamic for code-split heavy clients, <Suspense> for streamed boundaries, loading.tsx as route-segment Suspense, React Compiler (reactCompiler: true) stable in v16, React 19.2 features (<ViewTransition>, useEffectEvent, <Activity>). Anti-patterns: missing priority on LCP image, <img> over <Image>, no next/font (Google CDN FOUT), dynamic({ ssr: false }) for everything, <Suspense> around the whole page, loading.tsx at root."
+globs: ["app/**/*.tsx", "app/**/*.jsx", "components/**/*.tsx", "next.config.ts", "next.config.js"]
+---
+
+# Performance
+
+Next.js gives you the primitives. Performance work is about applying them in the right places: prioritizing LCP, deferring non-critical JS, streaming async work, and not shipping more JS than the page needs.
+
+## `next/image`
+
+The `<Image>` component handles modern format negotiation, responsive `srcset`, lazy loading, and the placeholder-blur. Always use it over a raw `<img>`.
+
+### `priority` for the LCP image
+
+The Largest Contentful Paint image (hero, banner, cover) should be eagerly loaded with `priority`. Lazy-loading the LCP element kills the score.
+
+```typescript
+// BAD - LCP image lazy-loads, browser fetches it after layout
+import Image from 'next/image';
+
+export default function Page() {
+  return (
+    <main>
+      <Image src="/hero.jpg" alt="Hero" width={1200} height={600} />
+      <article>...</article>
+    </main>
+  );
+}
+
+// CORRECT - LCP image has priority, fetch starts ASAP
+export default function Page() {
+  return (
+    <main>
+      <Image
+        src="/hero.jpg"
+        alt="Hero"
+        width={1200}
+        height={600}
+        priority           // eager + preload hint
+        fetchPriority="high" // HTML attr, optional companion
+      />
+      <article>...</article>
+    </main>
+  );
+}
+```
+
+One `priority` per page maximum. Multiple `priority` images compete and defeat the purpose.
+
+### `sizes` for responsive bandwidth
+
+When the image is fluid (CSS width changes by viewport), `sizes` tells the browser which `srcset` candidate to fetch. Skip it and the browser fetches the biggest candidate by default.
+
+```typescript
+// BAD - fluid image, no sizes, downloads the largest variant on mobile
+<Image src="/cover.jpg" alt="" width={1200} height={600} className="w-full" />
+
+// CORRECT - sizes lets browser pick the smallest sufficient variant
+<Image
+  src="/cover.jpg"
+  alt=""
+  width={1200}
+  height={600}
+  className="w-full"
+  sizes="(max-width: 640px) 100vw, (max-width: 1024px) 50vw, 33vw"
+/>
+```
+
+Why this matters: a 1200px image at 100% width on a 360px-wide phone downloads 1200px of pixel data the user never sees. With `sizes`, the browser picks a ~400px variant from the generated `srcset`.
+
+### `fill` for absolute-positioned containers
+
+When the image fills a parent (`position: relative`), use `fill` and skip `width`/`height`. You must also pass `sizes`.
+
+```typescript
+<div className="relative aspect-video">
+  <Image
+    src="/cover.jpg"
+    alt=""
+    fill
+    sizes="(max-width: 768px) 100vw, 50vw"
+    style={{ objectFit: 'cover' }}
+  />
+</div>
+```
+
+### `placeholder="blur"` for local imports
+
+When you import an image with a static import, Next generates a base64 blurDataURL at build time. Use it.
+
+```typescript
+import heroImg from './hero.jpg'; // static import, gets blurDataURL
+
+<Image
+  src={heroImg}
+  alt="Hero"
+  placeholder="blur"
+  priority
+/>
+```
+
+For remote images, supply your own `blurDataURL` (a tiny base64 jpeg) or skip the placeholder.
+
+### `quality` is coerced to `images.qualities` (v16)
+
+In v16 the `quality` prop is coerced to the nearest value in `images.qualities` config. Default config allows only `[75]`. A `quality={90}` silently becomes 75.
+
+```typescript
+// CONTEXT - default next.config.ts (no images.qualities)
+// images.qualities defaults to [75]
+
+// BAD - silently coerced to 75
+<Image src="/hero.jpg" alt="" quality={90} width={1200} height={600} />
+
+// CORRECT (option A) - widen the allowed list in config
+// next.config.ts
+const config = {
+  images: { qualities: [50, 75, 90] },
+};
+
+// CORRECT (option B) - drop the quality prop, use the default
+<Image src="/hero.jpg" alt="" width={1200} height={600} />
+```
+
+### `fetchPriority` as a passthrough
+
+`fetchPriority` is a standard HTML attribute that hints at fetch order. `priority` (Next-specific) sets `loading="eager"` plus preload. `fetchPriority` is a finer-grained hint and can be used independently.
+
+```typescript
+<Image src="/hero.jpg" alt="" priority fetchPriority="high" width={1200} height={600} />
+```
+
+### `images.remotePatterns` (not deprecated `images.domains`)
+
+```typescript
+// BAD - deprecated in v15, fully deprecated in v16
+// next.config.ts
+const config = {
+  images: { domains: ['cdn.example.com'] },
+};
+
+// CORRECT - remotePatterns is more precise (protocol + host + path + port)
+const config = {
+  images: {
+    remotePatterns: [
+      { protocol: 'https', hostname: 'cdn.example.com', pathname: '/images/**' },
+      { protocol: 'https', hostname: '**.example.com' }, // wildcard subdomain
+    ],
+  },
+};
+```
+
+### `images.localPatterns.search` for query-stringed local images
+
+Local images with query strings (e.g. cache-busting) need to be explicitly allowed.
+
+```typescript
+const config = {
+  images: {
+    localPatterns: [
+      { pathname: '/images/**', search: '' },
+      { pathname: '/api/og/**', search: 'id=*' },
+    ],
+  },
+};
+```
+
+## `next/font`
+
+Self-hosted fonts with zero external requests. The output is a build-time generated WOFF2 plus a preload hint.
+
+### Variable fonts with CSS variable
+
+```typescript
+// app/layout.tsx
+import { Inter, JetBrains_Mono } from 'next/font/google';
+
+const inter = Inter({
+  subsets: ['latin'],
+  variable: '--font-inter',
+  display: 'swap',
+});
+
+const mono = JetBrains_Mono({
+  subsets: ['latin'],
+  variable: '--font-mono',
+  display: 'swap',
+});
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en" className={`${inter.variable} ${mono.variable}`}>
+      <body className="font-sans">{children}</body>
+    </html>
+  );
+}
+```
+
+Then in CSS:
+
+```css
+body { font-family: var(--font-inter), system-ui, sans-serif; }
+code { font-family: var(--font-mono), ui-monospace, monospace; }
+```
+
+### `display: 'swap'`
+
+Renders fallback text immediately, swaps in the webfont when it loads. Avoids the invisible-text flash.
+
+### `subsets` to keep size in check
+
+Always specify subsets. Without them the full Unicode coverage ships, and a "Latin Extended" file can be 50KB+ instead of the 15KB you actually need.
+
+### Self-hosted automatically
+
+`next/font/google` downloads the font at build time and serves it from your domain. No external Google CDN request at runtime - this is essential for both performance and privacy / GDPR compliance.
+
+For local font files:
+
+```typescript
+import localFont from 'next/font/local';
+
+const myFont = localFont({
+  src: './my-font.woff2',
+  variable: '--font-my-font',
+  display: 'swap',
+});
+```
+
+## `next/dynamic`
+
+Code-split heavy Client Components so they don't ship in the initial bundle. Useful for charts, rich-text editors, code editors, map widgets - things north of ~30KB gzipped.
+
+```typescript
+// BAD - 200KB chart library lives in the initial bundle for everyone
+import { ExpensiveChart } from './chart';
+
+export function Dashboard() {
+  return <ExpensiveChart data={data} />;
+}
+
+// CORRECT - dynamic import, chunk loads on first render
+import dynamic from 'next/dynamic';
+
+const ExpensiveChart = dynamic(() => import('./chart').then(m => m.ExpensiveChart), {
+  loading: () => <ChartSkeleton />,
+});
+
+export function Dashboard() {
+  return <ExpensiveChart data={data} />;
+}
+```
+
+### `{ ssr: false }` for client-only libs
+
+Some libraries (charts, editors, map renderers) require `window` / `document` and break under SSR. Disable SSR for them.
+
+```typescript
+const RichEditor = dynamic(() => import('./editor'), {
+  ssr: false,
+  loading: () => <div className="h-64 animate-pulse bg-zinc-100" />,
+});
+```
+
+Caveat: `ssr: false` defers the entire render to the client. The component does NOT appear in the streamed HTML. Use only where SSR is impossible, not as a blanket choice.
+
+### When to use vs static imports
+
+Static imports are simpler and have no chunk-loading overhead. Use `next/dynamic` when:
+
+- The component is >~30KB gzipped
+- It's only rendered after user interaction (modal, drawer, settings panel)
+- It uses a `window`-dependent library that breaks SSR
+- It's behind a feature flag
+
+For small components, the chunk-fetch overhead is greater than the savings.
+
+## `<Suspense>` for streamed boundaries
+
+Wrap async Server Components in `<Suspense>` to stream them in independently. Without a `<Suspense>` boundary, the entire page waits for the slowest async child.
+
+### The slow-async-at-the-top anti-pattern
+
+```typescript
+// BAD - the whole page waits for slow analytics data
+export default async function Dashboard() {
+  const analytics = await fetchSlowAnalytics(); // 3 seconds
+  const sidebar = await fetchSidebar();          // 100ms
+  return (
+    <div>
+      <Sidebar data={sidebar} />
+      <AnalyticsChart data={analytics} />
+    </div>
+  );
+}
+
+// CORRECT - sidebar streams immediately, analytics streams when ready
+import { Suspense } from 'react';
+
+export default function Dashboard() {
+  return (
+    <div>
+      <Suspense fallback={<SidebarSkeleton />}>
+        <SidebarSection />
+      </Suspense>
+      <Suspense fallback={<AnalyticsSkeleton />}>
+        <AnalyticsSection />
+      </Suspense>
+    </div>
+  );
+}
+
+async function SidebarSection() {
+  const sidebar = await fetchSidebar();
+  return <Sidebar data={sidebar} />;
+}
+
+async function AnalyticsSection() {
+  const analytics = await fetchSlowAnalytics();
+  return <AnalyticsChart data={analytics} />;
+}
+```
+
+The user sees the sidebar in 100ms instead of waiting 3 seconds for everything.
+
+### Don't wrap the whole page
+
+A `<Suspense>` around the entire page (or page wrapper) defeats streaming. The boundary IS the streaming unit; if it's the whole page, nothing streams.
+
+## `loading.tsx`
+
+A `loading.tsx` file is automatically wrapped in a `<Suspense>` at the route segment boundary. It's the fallback for everything in that segment and below while data is loading.
+
+```typescript
+// app/dashboard/loading.tsx
+export default function Loading() {
+  return <DashboardSkeleton />;
+}
+```
+
+When the user navigates to `/dashboard`, the skeleton renders instantly while the page's async work completes. Replaced when the segment finishes rendering.
+
+### Don't put `loading.tsx` at the root
+
+A root `loading.tsx` (in `app/loading.tsx`) becomes the fallback for the entire app. The first paint after every navigation is the spinner. Place `loading.tsx` at the smallest segment that benefits from it.
+
+## React Compiler (v16+)
+
+The React Compiler is stable as an opt-in in v16. Babel-based, it auto-memoizes components and hooks, reducing the need for manual `useMemo` / `useCallback`.
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next';
+
+const config: NextConfig = {
+  reactCompiler: true,
+};
+
+export default config;
+```
+
+Trade-offs:
+
+- Build time increases (the compiler analyzes every component)
+- Bundles are slightly larger (memoization helpers are inlined)
+- Most manual `useMemo` / `useCallback` calls become redundant
+- React DevTools shows a "Memo" badge on auto-memoized components
+
+Verify against your installed version's changelog before enabling on a large codebase. The compiler is conservative but does occasionally find a component it cannot safely transform - check the build output for warnings.
+
+## React 19.2 features
+
+### `<ViewTransition>`
+
+Wraps an element for animated transitions on state change or route navigation. The browser handles the cross-fade / morph via the View Transitions API.
+
+```typescript
+'use client';
+import { ViewTransition } from 'react';
+
+<ViewTransition>
+  <li key={item.id}>{item.title}</li>
+</ViewTransition>
+```
+
+Pair with `transition` CSS for the visual effect. Browser support: verify against your installed version's changelog.
+
+### `useEffectEvent`
+
+Stable references to event handlers inside `useEffect`. Solves the "I want the latest closure value without re-running the effect" problem.
+
+```typescript
+'use client';
+import { useEffect } from 'react';
+import { experimental_useEffectEvent as useEffectEvent } from 'react';
+
+function ChatRoom({ roomId, theme }: { roomId: string; theme: string }) {
+  const onConnected = useEffectEvent(() => {
+    showNotification(`Connected to ${roomId}`, theme); // reads latest theme
+  });
+
+  useEffect(() => {
+    const conn = connect(roomId);
+    conn.on('open', onConnected);
+    return () => conn.disconnect();
+  }, [roomId]); // theme NOT in deps - useEffectEvent reads it fresh
+}
+```
+
+Still gated as `experimental_useEffectEvent` in some 19.x releases - verify against your installed version's changelog before adopting.
+
+### `<Activity>`
+
+Mounts a subtree but renders it offscreen / hidden. State is preserved when shown again. Useful for tabs, drawers, multi-step flows where you want to keep state warm.
+
+```typescript
+'use client';
+import { Activity } from 'react';
+
+<Activity mode={tab === 'analytics' ? 'visible' : 'hidden'}>
+  <AnalyticsPanel />
+</Activity>
+```
+
+The `<AnalyticsPanel />` keeps its state when `tab` switches away and back. Without `<Activity>`, the panel unmounts and loses state.
+
+## Common mistakes
+
+- **No `priority` on the LCP image.** LCP score tanks. One `priority` per page.
+- **Hardcoded `width`+`height` that don't match the rendered aspect ratio.** Layout shift (CLS). Match the source's aspect.
+- **`<img>` instead of `<Image>`.** No optimization, no `srcset`, no lazy-loading default, no format negotiation.
+- **No `next/font`.** Loading from Google CDN at runtime introduces an external dependency, leaks the user IP to Google, and risks FOUT.
+- **`next/dynamic({ ssr: false })` for everything.** Defeats streaming and SSR for content that didn't need to be client-only.
+- **`<Suspense>` around the whole page.** The page IS the boundary; nothing streams. Wrap individual async children.
+- **`loading.tsx` at the root segment.** Every navigation flashes the spinner. Place it deeper.
+- **`quality={90}` with default config.** Silently coerced to 75 in v16. Configure `images.qualities` or drop the prop.
+- **`images.domains` instead of `images.remotePatterns`.** Deprecated in v15, fully deprecated in v16.
+- **Missing `sizes` on a fluid `<Image>`.** Browser downloads the largest `srcset` candidate. Bandwidth waste on mobile.
+- **`fetchPriority="high"` on multiple images.** Defeats the priority. One high per page.
+- **Lazy-loading the LCP element.** Use `priority` instead.
+- **Manual `useMemo` / `useCallback` everywhere on v16 with React Compiler enabled.** Largely redundant. The compiler handles it.

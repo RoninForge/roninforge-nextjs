@@ -1,16 +1,14 @@
-// Anti-pattern: params as sync object
-export async function GET(
-  request: Request,
-  { params }: { params: { id: string } } // Anti-pattern: not Promise
-) {
-  // Anti-pattern: assuming this is cached (not in 15)
-  const data = await fetch('https://api.example.com/users');
-  return Response.json(data);
-}
+// Anti-pattern sample. DO NOT use as a template.
+// Violations:
+// 1. Returns raw DB rows (leaks passwordHash, isAdmin, deletedAt, audit columns)
+// 2. No session check at all (any caller, no auth)
+// 3. Sync params destructure (would be TypeError in v16 if dynamic)
 
-// Anti-pattern: mutation without revalidation
-export async function POST(request: Request) {
-  const body = await request.json();
-  await db.user.create({ data: body });
-  return Response.json({ success: true }); // No revalidation!
+import { NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+
+export async function GET() {
+  const users = await db.user.findMany();
+  // BAD: includes passwordHash, isAdmin, internal IDs
+  return NextResponse.json(users);
 }

@@ -1,0 +1,428 @@
+---
+description: "Next.js 16 metadata + SEO: static export const metadata vs generateMetadata (async params + searchParams in v16, ResolvingMetadata parent for merging), metadata.title.template, openGraph + twitter nested objects, metadataBase for canonical URLs, file conventions (robots.ts, sitemap.ts, manifest.ts, opengraph-image.tsx, twitter-image.tsx, icon.tsx, apple-icon.tsx), ImageResponse from next/og with async params + async id (was sync in v15), tw= prop for Tailwind utilities inside ImageResponse, paginated sitemap for >50K URLs. Anti-patterns: sync params in generateMetadata (v16 TypeError), missing metadataBase, lastModified: new Date() in sitemap, missing robots index:false on staging."
+globs: ["app/**/layout.tsx", "app/**/page.tsx", "app/**/opengraph-image.tsx", "app/**/twitter-image.tsx", "app/**/icon.tsx", "app/**/sitemap.ts", "app/**/robots.ts", "app/**/manifest.ts"]
+---
+
+# Metadata and SEO
+
+Next.js gives you two ways to produce per-route `<head>` content: static `export const metadata` and dynamic `generateMetadata`. Plus file-convention generators for robots / sitemap / manifest / OG images. This rule covers the shape, the v16-specific gotchas, and the patterns LLMs get wrong.
+
+## Static `metadata` export
+
+The simplest form. Use when the metadata is the same for every request to this route.
+
+```typescript
+// app/about/page.tsx
+import type { Metadata } from 'next';
+
+export const metadata: Metadata = {
+  title: 'About',
+  description: 'About this site',
+  openGraph: {
+    title: 'About',
+    description: 'About this site',
+    images: ['/about-og.png'],
+  },
+};
+
+export default function AboutPage() {
+  return <h1>About</h1>;
+}
+```
+
+## Dynamic `generateMetadata`
+
+Use when metadata depends on `params`, `searchParams`, or fetched data.
+
+### v16: both `params` and `searchParams` are async
+
+```typescript
+// BAD - v15 shape, TypeError in v16
+export async function generateMetadata(
+  { params }: { params: { slug: string } }
+): Promise<Metadata> {
+  const post = await getPost(params.slug);
+  return { title: post.title };
+}
+
+// CORRECT - v16
+import type { Metadata, ResolvingMetadata } from 'next';
+
+type Props = {
+  params: Promise<{ slug: string }>;
+  searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
+};
+
+export async function generateMetadata(
+  { params, searchParams }: Props,
+  parent: ResolvingMetadata
+): Promise<Metadata> {
+  const { slug } = await params;
+  const post = await getPost(slug);
+
+  // Compose with parent metadata (e.g. inherit openGraph defaults)
+  const parentOg = (await parent).openGraph ?? {};
+  const parentImages = parentOg.images ?? [];
+
+  return {
+    title: post.title,
+    description: post.excerpt,
+    openGraph: {
+      ...parentOg,
+      title: post.title,
+      description: post.excerpt,
+      images: [post.coverImage, ...(Array.isArray(parentImages) ? parentImages : [parentImages])],
+    },
+  };
+}
+```
+
+`generateMetadata` runs at request time. The result is merged with any parent layout's `metadata` exports - parent fields are inherited unless this segment overrides them.
+
+## `title.template` for app-wide title patterns
+
+A root layout can declare a title template; every child page only sets its own slug.
+
+```typescript
+// app/layout.tsx
+import type { Metadata } from 'next';
+
+export const metadata: Metadata = {
+  title: {
+    default: 'My App',          // used if a child has no title
+    template: '%s | My App',    // %s is replaced with the child's title
+  },
+  description: 'Default description',
+};
+
+// app/blog/[slug]/page.tsx
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { slug } = await params;
+  const post = await getPost(slug);
+  return { title: post.title }; // becomes "Post Title | My App"
+}
+```
+
+`title.absolute` opts out of the template for one page:
+
+```typescript
+export const metadata: Metadata = {
+  title: { absolute: 'Custom Page Title' }, // template is ignored
+};
+```
+
+## `openGraph` and `twitter`
+
+```typescript
+export const metadata: Metadata = {
+  title: 'My Page',
+  openGraph: {
+    title: 'My Page',
+    description: 'Description for social cards',
+    url: 'https://example.com/my-page',
+    siteName: 'My App',
+    images: [
+      { url: '/og.png', width: 1200, height: 630, alt: 'My Page' },
+    ],
+    locale: 'en_US',
+    type: 'website',
+  },
+  twitter: {
+    card: 'summary_large_image',
+    title: 'My Page',
+    description: 'Description for social cards',
+    images: ['/og.png'],
+    creator: '@myhandle',
+  },
+};
+```
+
+When `twitter` is omitted, the Twitter crawler falls back to `openGraph`. You only need explicit `twitter` for divergent card content.
+
+## `metadataBase` for canonical URL resolution
+
+Relative URLs (`/og.png`, `/about`) in metadata need a base. Set `metadataBase` once at the root layout.
+
+```typescript
+// BAD - no metadataBase, every relative URL emits a warning
+// app/layout.tsx
+export const metadata: Metadata = {
+  title: 'My App',
+  openGraph: {
+    images: ['/og.png'], // "metadataBase property is not set" warning
+  },
+};
+
+// CORRECT
+export const metadata: Metadata = {
+  metadataBase: new URL(
+    process.env.NEXT_PUBLIC_SITE_URL ?? 'http://localhost:3000'
+  ),
+  title: { default: 'My App', template: '%s | My App' },
+  openGraph: {
+    images: ['/og.png'], // resolved to https://example.com/og.png
+  },
+};
+```
+
+Set this in the root layout. Child segments inherit it.
+
+## `robots.ts`
+
+```typescript
+// app/robots.ts
+import type { MetadataRoute } from 'next';
+
+export default function robots(): MetadataRoute.Robots {
+  const base = process.env.NEXT_PUBLIC_SITE_URL ?? 'https://example.com';
+  return {
+    rules: [
+      { userAgent: '*', allow: '/', disallow: ['/admin', '/api'] },
+    ],
+    sitemap: `${base}/sitemap.xml`,
+  };
+}
+```
+
+For staging / preview environments, return a "no index" rule:
+
+```typescript
+export default function robots(): MetadataRoute.Robots {
+  if (process.env.VERCEL_ENV !== 'production') {
+    return { rules: [{ userAgent: '*', disallow: '/' }] };
+  }
+  return { rules: [{ userAgent: '*', allow: '/' }], sitemap: '...' };
+}
+```
+
+## `sitemap.ts`
+
+```typescript
+// app/sitemap.ts
+import type { MetadataRoute } from 'next';
+import { getAllPosts } from '@/lib/dal/posts';
+
+export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
+  const base = process.env.NEXT_PUBLIC_SITE_URL ?? 'https://example.com';
+  const posts = await getAllPosts();
+
+  const staticRoutes: MetadataRoute.Sitemap = [
+    { url: `${base}/`, lastModified: new Date('2026-01-01'), priority: 1.0 },
+    { url: `${base}/about`, lastModified: new Date('2026-03-15'), priority: 0.8 },
+  ];
+
+  const postRoutes: MetadataRoute.Sitemap = posts.map(post => ({
+    url: `${base}/blog/${post.slug}`,
+    lastModified: post.updatedAt,
+    priority: 0.6,
+  }));
+
+  return [...staticRoutes, ...postRoutes];
+}
+```
+
+### Paginated sitemaps for >50K URLs
+
+Sitemaps cap at 50K URLs / 50MB per Google's spec. Split into multiple sitemaps with `generateSitemaps`.
+
+```typescript
+// app/sitemap.ts
+import type { MetadataRoute } from 'next';
+
+export async function generateSitemaps(): Promise<{ id: number }[]> {
+  // Compute how many shards you need based on your post count
+  const total = await getPostCount();
+  const shards = Math.ceil(total / 50_000);
+  return Array.from({ length: shards }, (_, i) => ({ id: i }));
+}
+
+export default async function sitemap(
+  { id }: { id: number }
+): Promise<MetadataRoute.Sitemap> {
+  const start = id * 50_000;
+  const posts = await getPostsRange(start, start + 50_000);
+  return posts.map(p => ({
+    url: `https://example.com/blog/${p.slug}`,
+    lastModified: p.updatedAt,
+  }));
+}
+```
+
+## `manifest.ts`
+
+```typescript
+// app/manifest.ts
+import type { MetadataRoute } from 'next';
+
+export default function manifest(): MetadataRoute.Manifest {
+  return {
+    name: 'My App',
+    short_name: 'MyApp',
+    description: 'Description',
+    start_url: '/',
+    display: 'standalone',
+    background_color: '#ffffff',
+    theme_color: '#0369A1',
+    icons: [
+      { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
+      { src: '/icon-512.png', sizes: '512x512', type: 'image/png' },
+    ],
+  };
+}
+```
+
+## Dynamic OG images with `next/og`
+
+`opengraph-image.tsx`, `twitter-image.tsx`, `icon.tsx`, `apple-icon.tsx` are file conventions. Each is a React component that returns an `ImageResponse`.
+
+```typescript
+// app/blog/[slug]/opengraph-image.tsx
+import { ImageResponse } from 'next/og';
+import { getPost } from '@/lib/dal/posts';
+
+export const size = { width: 1200, height: 630 };
+export const contentType = 'image/png';
+
+// v16: params is a Promise
+export default async function OG({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params;
+  const post = await getPost(slug);
+
+  return new ImageResponse(
+    (
+      <div
+        style={{
+          width: '100%',
+          height: '100%',
+          background: '#0F172A',
+          color: '#F8FAFC',
+          padding: 80,
+          display: 'flex',
+          flexDirection: 'column',
+          justifyContent: 'center',
+        }}
+      >
+        <h1 style={{ fontSize: 72, margin: 0 }}>{post.title}</h1>
+        <p style={{ fontSize: 32, color: '#94A3B8' }}>{post.author.name}</p>
+      </div>
+    ),
+    size
+  );
+}
+```
+
+### v16: `id` in `generateImageMetadata` is async
+
+If you generate multiple OG images per route via `generateImageMetadata`, the callback receives `id` as a Promise (was a string in v15).
+
+```typescript
+// BAD - v15 shape
+export default function OG({ id }: { id: string }) {
+  return new ImageResponse(<div>{id}</div>, size);
+}
+
+// CORRECT - v16
+export async function generateImageMetadata() {
+  return [
+    { id: 'card-light', size: { width: 1200, height: 630 }, contentType: 'image/png' },
+    { id: 'card-dark', size: { width: 1200, height: 630 }, contentType: 'image/png' },
+  ];
+}
+
+export default async function OG({
+  params,
+  id,
+}: {
+  params: Promise<{ slug: string }>;
+  id: Promise<string>;
+}) {
+  const [{ slug }, variant] = await Promise.all([params, id]);
+  const post = await getPost(slug);
+  const isDark = variant === 'card-dark';
+
+  return new ImageResponse(
+    <div style={{ background: isDark ? '#0F172A' : '#F8FAFC' }}>{post.title}</div>,
+    { width: 1200, height: 630 }
+  );
+}
+```
+
+### Runtime selection for `ImageResponse`
+
+`ImageResponse` runs on the Edge runtime by default. Opt into Node.js when you need Node-only APIs (e.g. reading a file with `fs`).
+
+```typescript
+export const runtime = 'nodejs'; // default is 'edge'
+```
+
+### Tailwind utilities inside `ImageResponse` via `tw=`
+
+`ImageResponse` uses Satori under the hood, which supports a subset of CSS. The `tw=` prop applies Tailwind-style utility classes via a converter.
+
+```typescript
+return new ImageResponse(
+  (
+    <div tw="flex flex-col items-center justify-center w-full h-full bg-slate-900 text-white">
+      <h1 tw="text-7xl font-bold">{post.title}</h1>
+      <p tw="text-3xl text-slate-400 mt-4">{post.author.name}</p>
+    </div>
+  ),
+  size
+);
+```
+
+Caveats:
+
+- Not all Tailwind classes are supported (no animations, no transforms, no `gradient-to-*` shorthand).
+- The font must be loaded explicitly if you want anything other than the Satori default. Pass `fonts` in the `ImageResponse` options.
+
+### Don't hardcode URLs in OG images
+
+```typescript
+// BAD - hardcoded production URL, breaks on staging
+<img src="https://example.com/logo.png" />
+
+// CORRECT - read from env, fall back sensibly
+const base = process.env.NEXT_PUBLIC_SITE_URL ?? 'http://localhost:3000';
+<img src={`${base}/logo.png`} />
+```
+
+For relative URLs the file system has direct access to, `next/og` can also read from `public/` via `fs` (Node runtime only).
+
+## `icon.tsx` and `apple-icon.tsx`
+
+```typescript
+// app/icon.tsx - generates the favicon
+import { ImageResponse } from 'next/og';
+
+export const size = { width: 32, height: 32 };
+export const contentType = 'image/png';
+
+export default function Icon() {
+  return new ImageResponse(
+    (
+      <div style={{ background: '#0369A1', color: 'white', fontSize: 24, width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        M
+      </div>
+    ),
+    size
+  );
+}
+```
+
+`apple-icon.tsx` has the same shape, conventionally `180x180`.
+
+## Common mistakes
+
+- **Sync `params` destructure in `generateMetadata`.** v16 TypeError. `params` is a Promise.
+- **Sync `searchParams` destructure.** Same fix.
+- **Missing `metadataBase`.** Every relative URL emits a warning at build time. Set it once at the root layout.
+- **Hardcoded URLs in OG images.** Breaks on staging / preview. Read from env.
+- **No fallback `metadata.title`.** A child page without a title uses the template's `default`. Make sure both are set.
+- **`lastModified: new Date()` in `sitemap.ts`.** Cache-busts every build, signals Google to re-crawl every URL pointlessly. Use the actual modification time of the underlying data.
+- **Missing `robots: { index: false }` on staging.** Search engines index your preview deploys. Gate by `VERCEL_ENV` or similar.
+- **Sync `id` in `generateImageMetadata` callbacks.** v16 made it async. Await it.
+- **`ImageResponse` with `<img src="local.png">` on Edge runtime.** Edge can't read local files. Use Node runtime or fetch the image at build time and embed as base64.
+- **Static `metadata` export plus `generateMetadata` in the same file.** Only one is allowed per route segment. Pick one.
+- **OG image >5MB.** Twitter / Facebook reject. Keep dimensions at 1200x630 and the rendered PNG well under 1MB.
+- **Tailwind class on `ImageResponse` that Satori doesn't support.** Silently ignored. Check the Satori CSS subset.

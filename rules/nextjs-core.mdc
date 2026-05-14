@@ -1,0 +1,348 @@
+---
+description: "Next.js 16 core: App Router file conventions, Server Components first, 'use client' boundary discipline, async request APIs (cookies/headers/params/searchParams are Promises), the Data Access Layer pattern, Server Actions + useActionState, Cache Components opt-in, route segment config, server-only / client-only import guards, the 16.x deltas vs 15.x (cacheComponents flag, proxy.ts rename, revalidateTag arity, Turbopack default)."
+alwaysApply: true
+---
+
+# Next.js 16 Core
+
+Cursor: when you generate Next.js code, follow these rules. Target `next@16.0+` on `react@19.2+`. The companion `nextjs-anti-patterns` rule rejects the inverse patterns.
+
+## Imports and types
+
+```typescript
+// Server-side helpers (work in Server Components, Server Actions, Route Handlers)
+import { cookies, headers, draftMode } from 'next/headers';
+
+// Navigation (App Router only - NEVER from 'next/router')
+import { redirect, notFound, permanentRedirect } from 'next/navigation';
+import { useRouter, usePathname, useSearchParams } from 'next/navigation'; // client
+
+// Page / layout / route prop types (after `next typegen` once)
+import type { PageProps, LayoutProps, RouteContext } from 'next';
+
+// Cache directives (stable since v16)
+import { unstable_cache } from 'next/cache'; // legacy, prefer 'use cache' directive
+import { revalidatePath, revalidateTag, updateTag } from 'next/cache';
+import { cacheLife, cacheTag } from 'next/cache';
+
+// React 19 hooks
+import { useActionState, use, cache } from 'react';
+import { useFormStatus } from 'react-dom'; // still here, only inside <form> children
+
+// Taint APIs (still flagged experimental in v16 - alias on import)
+import { experimental_taintUniqueValue as taintUniqueValue } from 'react';
+import { experimental_taintObjectReference as taintObjectReference } from 'react';
+```
+
+> Never import `Page` types from `next/router` - that is the Pages Router namespace. App Router uses `next/navigation`.
+
+## Server Components are the default
+
+Every file in `app/` is a Server Component unless it (or one of its ancestors) declares `'use client'`. Server Components:
+
+- Run on the server, never ship JS to the client
+- Can be `async` and `await` data directly
+- Cannot use React hooks (`useState`, `useEffect`, `useReducer`, ...) or browser APIs
+- Cannot use React Context (`createContext` providers do not propagate to server children)
+
+```typescript
+// app/blog/page.tsx (Server Component)
+import { getPosts } from '@/lib/dal/posts';
+
+export default async function BlogIndex() {
+  const posts = await getPosts(); // direct DAL call, runs on the server
+  return (
+    <ul>
+      {posts.map(p => <li key={p.id}>{p.title}</li>)}
+    </ul>
+  );
+}
+```
+
+## The `'use client'` boundary
+
+A `'use client'` directive marks a file (and everything it imports transitively) as client-rendered. Push the boundary as far down the tree as possible. A `'use client'` on a layout makes the entire subtree client-rendered.
+
+```typescript
+// app/(dashboard)/layout.tsx (Server Component - no directive)
+import { Sidebar } from './_components/sidebar';
+export default function Layout({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="grid grid-cols-[200px_1fr]">
+      <Sidebar />            {/* small Client Component */}
+      <main>{children}</main> {/* Server Components flow through */}
+    </div>
+  );
+}
+
+// app/(dashboard)/_components/sidebar.tsx
+'use client';
+import { useState } from 'react';
+export function Sidebar() {
+  const [open, setOpen] = useState(true);
+  /* ... */
+}
+```
+
+A Server Component can render a Client Component, but the props passed must be serializable (no functions, no class instances, no Dates with circular refs).
+
+## `server-only` and `client-only` import guards
+
+When a module must never cross the boundary, mark it.
+
+```typescript
+// lib/dal/posts.ts
+import 'server-only'; // throws at build time if a Client Component imports this
+
+export async function getPosts() {
+  const session = await verifySession();
+  if (!session) return [];
+  return db.post.findMany({ where: { authorId: session.userId } });
+}
+```
+
+```typescript
+// lib/browser/local-storage.ts
+import 'client-only'; // throws at build time if a Server Component imports this
+
+export function readPref(key: string) {
+  return window.localStorage.getItem(key);
+}
+```
+
+## Async request APIs (the v15+ rule, fully enforced in v16)
+
+`cookies()`, `headers()`, `draftMode()`, `params`, `searchParams`, and the `id` in image-metadata callbacks are all Promises. There is no sync form.
+
+```typescript
+// Server Component / async function
+import { cookies, headers } from 'next/headers';
+
+export default async function Page({ params }: PageProps<'/blog/[slug]'>) {
+  const { slug } = await params;
+  const cookieStore = await cookies();
+  const headerList = await headers();
+  /* ... */
+}
+
+// Route Handler
+export async function GET(req: Request, ctx: RouteContext<'/users/[id]'>) {
+  const { id } = await ctx.params;
+  /* ... */
+}
+```
+
+Setting cookies is forbidden during render. Mutations live in Server Actions, Route Handlers, or `proxy.ts`.
+
+## Data Access Layer (Vercel's official recommendation)
+
+The DAL is a server-only module that centralizes data access AND authorization. Every Server Component, Server Action, and Route Handler goes through it.
+
+```typescript
+// lib/dal/index.ts
+import 'server-only';
+import { cache } from 'react';
+import { cookies } from 'next/headers';
+import { db } from '@/lib/db';
+
+export const verifySession = cache(async () => {
+  const cookieStore = await cookies();
+  const token = cookieStore.get('session')?.value;
+  if (!token) return null;
+  const session = await db.session.findUnique({ where: { token } });
+  if (!session || session.expiresAt < new Date()) return null;
+  return { userId: session.userId, role: session.role };
+});
+
+// DTO-returning function with authz baked in
+export async function getMyPosts() {
+  const session = await verifySession();
+  if (!session) return [];
+  const posts = await db.post.findMany({ where: { authorId: session.userId } });
+  return posts.map(p => ({ id: p.id, title: p.title, createdAt: p.createdAt.toISOString() }));
+}
+```
+
+`cache()` from React memoizes `verifySession` per render pass - the underlying cookie lookup + DB query runs once even if 50 Server Components call it. See the dedicated `nextjs-data-access-layer` rule for the full pattern.
+
+## Server Actions: validate, authorize, mutate, revalidate
+
+```typescript
+// app/posts/actions.ts
+'use server';
+
+import { z } from 'zod';
+import { revalidateTag } from 'next/cache';
+import { redirect } from 'next/navigation';
+import { verifySession } from '@/lib/dal';
+import { db } from '@/lib/db';
+
+const CreatePostSchema = z.object({
+  title: z.string().min(1).max(200),
+  body: z.string().min(1).max(50_000),
+});
+
+type State = { errors?: Record<string, string[]>; ok?: boolean };
+
+export async function createPost(_prev: State, formData: FormData): Promise<State> {
+  const session = await verifySession();
+  if (!session) return { errors: { _form: ['Sign in to post'] } };
+
+  const parsed = CreatePostSchema.safeParse({
+    title: formData.get('title'),
+    body: formData.get('body'),
+  });
+  if (!parsed.success) return { errors: parsed.error.flatten().fieldErrors };
+
+  try {
+    await db.post.create({
+      data: { ...parsed.data, authorId: session.userId },
+    });
+  } catch (e) {
+    return { errors: { _form: ['Failed to save'] } };
+  }
+
+  revalidateTag('posts', 'max');
+  redirect('/posts'); // OUTSIDE the try/catch
+}
+```
+
+Bind on the client with `useActionState`:
+
+```typescript
+'use client';
+import { useActionState } from 'react';
+import { createPost } from './actions';
+
+export function CreatePostForm() {
+  const [state, formAction, pending] = useActionState(createPost, {});
+  return (
+    <form action={formAction}>
+      <input name="title" />
+      {state.errors?.title && <p>{state.errors.title[0]}</p>}
+      <textarea name="body" />
+      <SubmitButton pending={pending} />
+    </form>
+  );
+}
+```
+
+## Cache Components: opt-in caching
+
+With `cacheComponents: true` in `next.config.ts`, all dynamic code is dynamic by default. Cache explicitly with the `'use cache'` directive.
+
+```typescript
+// next.config.ts
+const config = { cacheComponents: true };
+export default config;
+
+// lib/dal/prices.ts
+import 'server-only';
+import { cacheLife, cacheTag } from 'next/cache';
+
+export async function getPrices() {
+  'use cache';
+  cacheLife('hours');
+  cacheTag('prices');
+  const res = await fetch('https://api.example.com/prices');
+  return res.json();
+}
+```
+
+The `'use cache'` directive can be at function, component, or file level. `cacheLife` accepts named profiles (`'seconds'`, `'minutes'`, `'hours'`, `'days'`, `'weeks'`, `'max'`) or inline `{ stale, revalidate, expire }`.
+
+Invalidation:
+
+- `revalidateTag(tag, profile)` - clears cache, re-renders affected routes. Required 2-arg in v16.
+- `updateTag(tag)` - inside a Server Action: expires AND refreshes within the same request (read-your-writes).
+- `refresh()` - inside a Server Action: refreshes uncached data without touching cache.
+- `revalidatePath(path)` - path-scoped invalidation, still supported.
+
+## Route segment config
+
+Per-segment opts via exports at the top of `page.tsx`, `layout.tsx`, or `route.ts`:
+
+```typescript
+export const runtime = 'nodejs' | 'edge';        // default: nodejs
+export const dynamic = 'force-dynamic' | 'force-static' | 'error' | 'auto';
+export const dynamicParams = true | false;
+export const revalidate = 60 | false;            // ISR seconds, or false for static
+export const fetchCache = 'default-cache' | 'force-cache' | 'force-no-store';
+export const preferredRegion = 'auto' | 'global' | string[];
+export const maxDuration = 60;                   // serverless function max seconds
+```
+
+With Cache Components enabled, prefer the `'use cache'` directive over `dynamic`/`fetchCache`/`revalidate` exports for new code.
+
+## File conventions
+
+```
+app/
+  layout.tsx           Root layout (must render <html><body>)
+  page.tsx             Home page
+  loading.tsx          Suspense fallback for this segment + children
+  error.tsx            Error boundary for page + children (NOT for sibling layout)
+  not-found.tsx        Rendered when notFound() is called
+  global-error.tsx     Replaces root layout on top-level throws (must render <html><body>)
+  template.tsx         Like layout but re-mounts on navigation
+  default.tsx          Required slot fallback for parallel routes (build fails without it)
+  route.ts             Route handler (GET/POST/etc.)
+  middleware.ts        DEPRECATED in v16, renamed to proxy.ts at the root
+  proxy.ts             Edge-of-the-app interceptor (runs on every matching request)
+  robots.ts            Generates /robots.txt
+  sitemap.ts           Generates /sitemap.xml
+  manifest.ts          Generates /manifest.webmanifest
+  opengraph-image.tsx  Generates /opengraph-image
+  twitter-image.tsx    Generates /twitter-image
+  icon.tsx             Generates favicons
+```
+
+## v16 deltas vs v15 (the items most likely to be missed by an LLM trained on v15)
+
+- **`middleware.ts` → `proxy.ts`** at the root. Function name `middleware` → `proxy`. Runs on Node.js runtime only. `middleware.ts` still works for the Edge case but is deprecated.
+- **`experimental.ppr`, `experimental.dynamicIO`, `experimental.useCache`** flags removed. All collapsed into top-level `cacheComponents: true`.
+- **`revalidateTag(tag)`** single-arg is deprecated; depending on installed patch and TS settings it surfaces as either a TypeScript error or a runtime deprecation. Treat it as an error and always pass `revalidateTag(tag, profile)`.
+- **`updateTag(tag)`** is new. Server Actions only. Read-your-writes within a request.
+- **`refresh()`** is new. Server Actions only. Refresh uncached data.
+- **Turbopack is the default bundler.** Custom `webpack` config in `next.config` breaks `next build` unless you run with `--webpack`.
+- **`next lint` removed.** Run ESLint or Biome directly.
+- **`images.domains` deprecated.** Use `images.remotePatterns`.
+- **`images.quality`** is coerced to the nearest value in `images.qualities` (default `[75]`).
+- **`images.minimumCacheTTL`** default raised from 60s to 14400s.
+- **Parallel routes require `default.js`** in every slot - build fails without it.
+- **`serverRuntimeConfig` / `publicRuntimeConfig`** removed. Read `process.env` directly.
+- **AMP** support gone.
+- **`scroll-behavior: smooth`** no longer auto-applied. Opt in with `data-scroll-behavior="smooth"` on `<html>`.
+- **`generateImageMetadata` callback `id`** is now a Promise (was a string).
+- **React 19.2 features** are usable: `<ViewTransition>`, `useEffectEvent`, `<Activity>`.
+- **React Compiler** stable as opt-in: `reactCompiler: true` in `next.config.ts`.
+
+## What an LLM trained on 2023 still gets wrong
+
+| Pattern | Correct replacement |
+|---|---|
+| `getServerSideProps` / `getStaticProps` | async Server Component with direct await |
+| `pages/api/*.ts` | `app/api/<path>/route.ts` |
+| `'use client'` on layouts | push the directive down to the smallest interactive component |
+| `useEffect(() => fetch(...))` for server data | async Server Component |
+| `cookies().get(...)` sync | `(await cookies()).get(...)` |
+| `params.id` direct | `const { id } = await params` |
+| `useFormState` from `react-dom` | `useActionState` from `react` |
+| `revalidateTag('foo')` | `revalidateTag('foo', 'max')` or `updateTag('foo')` |
+| `middleware.ts` (new code) | `proxy.ts` |
+| `experimental.ppr: true` | `cacheComponents: true` (top-level) |
+| `next lint` script | `eslint .` directly |
+| `images.domains: [...]` | `images.remotePatterns: [...]` |
+| `next/legacy/image` | `next/image` |
+| `serverRuntimeConfig` | `process.env.*` |
+| `redirect()` inside `try/catch` | `redirect()` outside the try/catch |
+
+## Version targeting
+
+Rules in this plugin assume:
+
+- `next` >= 16.0.0 (current stable as of 2026-05). Many patterns work back to 15.x with the noted deltas.
+- `react` >= 19.2.0 (matches what Next.js 16 ships with).
+- `typescript` >= 5.6.
+
+If you are on 15.x and not ready to upgrade, use the `/nextjs-migrate-v15-to-v16` skill for the codemod sequence.

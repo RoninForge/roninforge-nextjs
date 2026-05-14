@@ -1,0 +1,324 @@
+---
+description: "Next.js 16 error handling: error.tsx (route-segment boundary, must be 'use client', catches page + children but NOT sibling layout), global-error.tsx (replaces root layout, must render <html><body>, catches everything that bubbles past error.tsx), not-found.tsx (rendered when notFound() is called or route is unmatched). Boundary-scope rules with ASCII tree. The reset() callback. Why notFound() and redirect() must be OUTSIDE try/catch. Logging errors to Sentry / GlitchTip / Datadog from inside error.tsx. Common mistakes: error.tsx next to a layout expecting to catch it, notFound() inside try/catch, missing 'use client' on error.tsx, no global-error.tsx, reset button that just refreshes URL."
+globs: ["app/**/error.tsx", "app/**/global-error.tsx", "app/**/not-found.tsx"]
+---
+
+# Error Handling
+
+The App Router gives you three error-handling files: `error.tsx`, `global-error.tsx`, `not-found.tsx`. Each catches a different scope of failure. LLMs reliably get the scope rules wrong; this rule pins them down.
+
+## `error.tsx` - route-segment error boundary
+
+Catches errors thrown in the segment's `page.tsx` and everything below it. Must be a Client Component.
+
+```typescript
+// app/dashboard/error.tsx
+'use client';
+
+import { useEffect } from 'react';
+
+export default function Error({
+  error,
+  reset,
+}: {
+  error: Error & { digest?: string };
+  reset: () => void;
+}) {
+  useEffect(() => {
+    // Log to observability platform
+    console.error(error);
+  }, [error]);
+
+  return (
+    <div role="alert" className="p-8">
+      <h2>Something went wrong</h2>
+      <p>{error.message}</p>
+      <button onClick={() => reset()}>Try again</button>
+    </div>
+  );
+}
+```
+
+Key constraints:
+
+- Must include `'use client'` - the boundary uses Client Component runtime.
+- Receives `{ error, reset }` props. The `error` prop has a `digest` field with the server-side stack ID.
+- The `reset()` callback re-renders the boundary's children.
+
+## What `error.tsx` does and does NOT catch
+
+This is the trap LLMs fall into. Draw the tree to keep it straight:
+
+```
+app/
+  layout.tsx                  <-- root layout errors -> caught by global-error.tsx only
+  error.tsx                   <-- catches root page.tsx + descendants
+  global-error.tsx            <-- last-resort catch for anything that escapes every error.tsx
+  page.tsx
+  dashboard/
+    layout.tsx                <-- this layout's THROWS -> caught by /app error.tsx OR global-error.tsx
+                              <-- (NOT by /app/dashboard/error.tsx below)
+    error.tsx                 <-- catches /app/dashboard/page.tsx + its children
+    page.tsx
+    settings/
+      page.tsx                <-- a throw here bubbles up to /app/dashboard/error.tsx
+```
+
+The rule: `error.tsx` wraps its sibling `page.tsx` and the segment's children, but NOT the sibling `layout.tsx`. If you want to catch errors from a layout, the `error.tsx` must be ONE segment higher.
+
+```typescript
+// COMMON BUG - this layout's throw is NOT caught by the sibling error.tsx
+// app/dashboard/layout.tsx
+export default async function DashboardLayout({ children }: { children: React.ReactNode }) {
+  const data = await loadDashboardChrome();
+  if (!data) throw new Error('Failed to load chrome'); // <-- escapes the sibling error.tsx
+  return <div>{children}</div>;
+}
+
+// app/dashboard/error.tsx <-- this CANNOT catch the layout above
+```
+
+To handle a layout error, either:
+
+1. Put an `error.tsx` one segment higher (`app/error.tsx`), or
+2. Let it bubble to `global-error.tsx`, or
+3. Handle the failure inside the layout itself (try/catch, render fallback content).
+
+## `global-error.tsx`
+
+The last-resort error boundary. Replaces the root layout when triggered, so it must render its own `<html><body>` tags.
+
+```typescript
+// app/global-error.tsx
+'use client';
+
+export default function GlobalError({
+  error,
+  reset,
+}: {
+  error: Error & { digest?: string };
+  reset: () => void;
+}) {
+  return (
+    <html>
+      <body>
+        <h2>Something went wrong</h2>
+        <p>An unexpected error occurred.</p>
+        <button onClick={() => reset()}>Try again</button>
+      </body>
+    </html>
+  );
+}
+```
+
+Catches:
+
+- Errors thrown by the root `layout.tsx`
+- Errors thrown by `template.tsx`
+- Anything that escapes every `error.tsx` in the tree
+
+Without a `global-error.tsx`, top-level throws fall to the default platform error page (the Vercel "Application Error" page on Vercel, a generic 500 elsewhere). Every production app should have one.
+
+## `not-found.tsx`
+
+Rendered when:
+
+- `notFound()` is called from a Server Component, Server Action, or Route Handler
+- A route doesn't match any defined segment
+
+```typescript
+// app/not-found.tsx
+import Link from 'next/link';
+
+export default function NotFound() {
+  return (
+    <div className="p-8">
+      <h2>404 - Not Found</h2>
+      <p>The page you requested doesn't exist.</p>
+      <Link href="/">Go home</Link>
+    </div>
+  );
+}
+```
+
+Place at a specific segment for scoped 404s:
+
+```
+app/
+  not-found.tsx              <-- catches unmatched routes app-wide
+  blog/
+    [slug]/
+      not-found.tsx          <-- catches notFound() called inside this segment
+      page.tsx
+```
+
+The nearest `not-found.tsx` ancestor renders.
+
+## The `reset()` callback
+
+`reset()` re-renders the error boundary's children. Useful for transient errors (network blips, a third-party API was down for 2 seconds). Useless for permanent errors.
+
+```typescript
+'use client';
+
+export default function Error({ error, reset }: Props) {
+  // For "Failed to fetch" - reset retries the fetch
+  // For "User does not exist" - reset just shows the same error again
+
+  return (
+    <div role="alert">
+      <h2>Something went wrong</h2>
+      <p>{error.message}</p>
+      <button onClick={() => reset()}>Try again</button>
+      <a href="/">Go home</a>
+    </div>
+  );
+}
+```
+
+Calling `reset()` does NOT clear the URL or any state outside the boundary. It just re-renders the children. If the error is a result of the URL (e.g. a missing record at `/posts/[id]`), reset will fail the same way. Use `redirect()` to a different URL for that case.
+
+## `redirect()` and `notFound()` must be OUTSIDE try/catch
+
+Both work by throwing a special error that the framework catches at the boundary. A `try { ... notFound(); ... } catch (e) {}` intercepts the throw and the not-found never triggers.
+
+```typescript
+// BAD - notFound swallowed
+import { notFound } from 'next/navigation';
+
+export default async function Page({ params }: Props) {
+  const { id } = await params;
+  try {
+    const post = await db.post.findUnique({ where: { id } });
+    if (!post) notFound(); // throws NEXT_NOT_FOUND
+    return <Article post={post} />;
+  } catch (e) {
+    console.error(e); // logs NEXT_NOT_FOUND, then the function returns nothing
+    return <div>Error</div>;
+  }
+}
+
+// CORRECT - call notFound OUTSIDE try/catch
+export default async function Page({ params }: Props) {
+  const { id } = await params;
+
+  let post;
+  try {
+    post = await db.post.findUnique({ where: { id } });
+  } catch (e) {
+    throw new Error('Failed to load post', { cause: e });
+  }
+
+  if (!post) notFound();
+  return <Article post={post} />;
+}
+```
+
+Same pattern for `redirect()`. See the `nextjs-server-actions` rule for the equivalent in actions.
+
+If you must catch other errors and still allow `notFound` / `redirect` to propagate, re-throw any error whose message matches the framework signals (do NOT import the internal helpers - they live under `next/dist/*` and are not a stable API):
+
+```typescript
+try {
+  // ...
+} catch (e) {
+  if (e instanceof Error && /^NEXT_(REDIRECT|NOT_FOUND)$/.test(e.message)) {
+    throw e; // re-throw the framework signal
+  }
+  // handle other errors
+}
+```
+
+## `redirect('/error')` vs `error.tsx`
+
+Default to `error.tsx`. It is the canonical pattern: scoped, has access to the error object, supports `reset()`.
+
+Use `redirect('/error')` only when the error context must persist across navigation (e.g. the user lands on a "your subscription is past due" page that has its own URL and lives across multiple sessions). Rare.
+
+```typescript
+// 95% of cases - use error.tsx, no redirect
+'use client';
+export default function Error({ error, reset }: Props) {
+  return <div>...</div>;
+}
+
+// 5% of cases - the error has a stable URL surface
+import { redirect } from 'next/navigation';
+
+if (subscription.status === 'past_due') {
+  redirect('/billing/past-due');
+}
+```
+
+## Logging to your observability platform
+
+Send the error to your observability platform from inside `error.tsx`. The `error.digest` field is the server-side stack ID - log it so the server-side trace can be correlated.
+
+```typescript
+'use client';
+
+import { useEffect } from 'react';
+import * as Sentry from '@sentry/nextjs';
+
+export default function Error({
+  error,
+  reset,
+}: {
+  error: Error & { digest?: string };
+  reset: () => void;
+}) {
+  useEffect(() => {
+    Sentry.captureException(error, {
+      tags: { digest: error.digest, boundary: 'dashboard/error.tsx' },
+    });
+  }, [error]);
+
+  return (
+    <div role="alert">
+      <h2>Something went wrong</h2>
+      <button onClick={() => reset()}>Try again</button>
+    </div>
+  );
+}
+```
+
+Sentry, GlitchTip (self-hosted Sentry-compatible), Datadog, Rollbar, Highlight - they all have Next.js integrations with the same shape. The integration usually instruments server-side automatically; the `error.tsx` `useEffect` is for the client-side surface of the error.
+
+## Don't expose error details in production
+
+`error.message` and `error.stack` may contain sensitive info (table names, internal IDs, infra paths). In production show a generic message; log the real one.
+
+```typescript
+'use client';
+
+export default function Error({ error, reset }: Props) {
+  return (
+    <div role="alert">
+      <h2>Something went wrong</h2>
+      <p>
+        {process.env.NODE_ENV === 'development'
+          ? error.message
+          : 'An unexpected error occurred. Our team has been notified.'}
+      </p>
+      <p className="text-xs text-zinc-500">Reference: {error.digest}</p>
+      <button onClick={() => reset()}>Try again</button>
+    </div>
+  );
+}
+```
+
+The `digest` is safe to show users; it links to the server-side log without leaking the message.
+
+## Common mistakes
+
+- **`error.tsx` placed next to a `layout.tsx` expecting it to catch layout errors.** It cannot. Move `error.tsx` one segment higher, or rely on `global-error.tsx`.
+- **`notFound()` inside try/catch.** Silently swallowed. Call outside the try/catch.
+- **`redirect()` inside try/catch.** Same problem. Call outside, or re-throw any error whose message matches `^NEXT_(REDIRECT|NOT_FOUND)$` from within the catch.
+- **Missing `'use client'` on `error.tsx`.** Next throws at build time with a clear message, but the trap is forgetting it on a copy-pasted file.
+- **No `global-error.tsx`.** Root layout throws produce the default platform error page. Always ship one.
+- **`global-error.tsx` without `<html><body>`.** It replaces the root layout, so it must render the document shell itself.
+- **`reset()` button that calls `router.refresh()` instead.** Refresh re-fetches everything; `reset()` retries the boundary's children specifically. Different semantics.
+- **Exposing `error.message` directly to users in production.** Leaks internal info. Show a generic message + the digest.
+- **No `useEffect` to log the error.** Error happens, user sees the boundary, but nothing reaches your observability platform.
+- **`not-found.tsx` only at the root when scoped 404s would be clearer.** Place `not-found.tsx` at the deepest segment that benefits from a tailored message.
+- **Throwing strings instead of Errors.** `throw 'oops'` produces an error object with no stack. Always `throw new Error(message)`.

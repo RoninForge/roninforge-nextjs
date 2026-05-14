@@ -1,0 +1,255 @@
+---
+description: "The Data Access Layer (DAL) pattern Vercel officially recommends for Next.js auth and data fetching in 2025+. Centralizes session verification, authorization, and DTO shaping in a server-only module. cache()-memoized verifySession() so 50 components calling it share one DB hit per render. Always re-verifies in every consumer (Server Component, Server Action, Route Handler). Returns DTOs, never raw DB rows. Uses 'server-only' to throw at build time if a Client Component imports it. taintUniqueValue / taintObjectReference for high-stakes values."
+globs: ["**/lib/dal/**/*.ts", "**/lib/auth/**/*.ts", "**/lib/data/**/*.ts", "**/_dal/**/*.ts"]
+---
+
+# Data Access Layer
+
+The DAL is the single server-only module that controls how data is fetched and what reaches render context. Every Server Component, Server Action, and Route Handler that touches user data goes through it.
+
+Vercel's auth guide (2025+) calls this the canonical pattern. Without it you end up scattering `verifySession()` calls across components, missing some, and shipping IDOR vulnerabilities.
+
+## File layout
+
+```
+lib/
+  dal/
+    index.ts           // verifySession + re-exports
+    posts.ts           // post-related DAL functions
+    users.ts           // user-related DAL functions
+    billing.ts         // ... etc per domain
+  db.ts                // Prisma / Drizzle / raw driver client
+```
+
+`lib/dal/*` is server-only. Mark it explicitly.
+
+## `verifySession` - the foundation
+
+Cached per render pass via React's `cache()`. The first call hits the cookie store + DB; the next 49 calls return the memoized result.
+
+```typescript
+// lib/dal/index.ts
+import 'server-only';
+import { cache } from 'react';
+import { cookies } from 'next/headers';
+import { db } from '@/lib/db';
+
+export type Session = {
+  userId: string;
+  role: 'user' | 'admin';
+  expiresAt: Date;
+};
+
+export const verifySession = cache(async (): Promise<Session | null> => {
+  const cookieStore = await cookies();
+  const token = cookieStore.get('session')?.value;
+  if (!token) return null;
+
+  const session = await db.session.findUnique({
+    where: { token },
+    select: { userId: true, role: true, expiresAt: true },
+  });
+  if (!session) return null;
+  if (session.expiresAt < new Date()) return null;
+
+  return session;
+});
+
+export async function requireSession(): Promise<Session> {
+  const session = await verifySession();
+  if (!session) {
+    throw new Error('Unauthorized');
+  }
+  return session;
+}
+
+export async function requireRole(role: Session['role']): Promise<Session> {
+  const session = await requireSession();
+  if (session.role !== role) {
+    throw new Error('Forbidden');
+  }
+  return session;
+}
+```
+
+Notes:
+
+- `import 'server-only'` causes a build-time error if a Client Component ever imports this file.
+- `cache(fn)` from `react` is the right memoizer here. It scopes to a single render pass - perfect for per-request memoization. Do NOT use `unstable_cache` from `next/cache` for this; that one caches across requests.
+- `verifySession` returns `null` for the unauthenticated case. `requireSession` throws. Pick the right one at the call site - components that conditionally render should use `verifySession`; components that should never run unauthenticated should use `requireSession` (and the parent should redirect first).
+
+## DTO-returning data functions
+
+Every DAL function is a small thin function that does three things: verify the session, check resource ownership, return a DTO (not the raw DB row).
+
+```typescript
+// lib/dal/posts.ts
+import 'server-only';
+import { requireSession } from './index';
+import { db } from '@/lib/db';
+
+export type PostListItem = {
+  id: string;
+  title: string;
+  createdAt: string;
+};
+
+export type PostDetail = PostListItem & {
+  body: string;
+  authorName: string;
+};
+
+export async function getMyPosts(): Promise<PostListItem[]> {
+  const session = await requireSession();
+  const posts = await db.post.findMany({
+    where: { authorId: session.userId },
+    select: { id: true, title: true, createdAt: true },
+    orderBy: { createdAt: 'desc' },
+  });
+  return posts.map(p => ({
+    id: p.id,
+    title: p.title,
+    createdAt: p.createdAt.toISOString(),
+  }));
+}
+
+// Public-read path: look up by `slug` (the URL-friendly identifier).
+// No auth required.
+export async function getPostForViewing(slug: string): Promise<PostDetail | null> {
+  const post = await db.post.findUnique({
+    where: { slug, published: true },
+    select: {
+      id: true,
+      title: true,
+      body: true,
+      createdAt: true,
+      author: { select: { name: true } },
+    },
+  });
+  if (!post) return null;
+  return {
+    id: post.id,
+    title: post.title,
+    body: post.body,
+    createdAt: post.createdAt.toISOString(),
+    authorName: post.author.name,
+  };
+}
+
+// Owner-only path: look up by internal `id` (the surrogate key, not the slug).
+// Requires auth + resource ownership.
+export async function getPostForEditing(id: string): Promise<PostDetail | null> {
+  const session = await requireSession();
+  const post = await db.post.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      title: true,
+      body: true,
+      createdAt: true,
+      authorId: true,
+      author: { select: { name: true } },
+    },
+  });
+  if (!post) return null;
+  if (post.authorId !== session.userId) {
+    throw new Error('Forbidden');
+  }
+  return {
+    id: post.id,
+    title: post.title,
+    body: post.body,
+    createdAt: post.createdAt.toISOString(),
+    authorName: post.author.name,
+  };
+}
+```
+
+Why two separate functions for "viewing" and "editing":
+
+- `getPostForViewing` is the public-read path, keyed on the URL-friendly `slug`. No auth required. The `where: { slug, published: true }` filter prevents draft posts from leaking.
+- `getPostForEditing` requires auth + ownership and uses the internal `id` (surrogate key). Owners get the linked `id` from their own dashboard; the slug is for public URLs.
+
+The DAL function name communicates the access shape; the lookup key communicates which identifier the caller controls.
+
+## What the DAL is NOT for
+
+- **Mutations.** Mutations live in Server Actions. The action calls the DAL for the read side of a write (verify session, fetch the resource, check ownership), but the write itself stays in the action.
+- **Caching.** Pair the DAL with `'use cache'` in functions that read from external APIs - but per-user data must include the user ID in the cache key. See `nextjs-cache-components`.
+- **Computed values that don't need auth.** Keep those in plain `lib/` modules.
+
+## Always re-verify
+
+Page-level auth in a layout, a `proxy.ts` redirect, or even a parent Server Component does NOT extend to the DAL function. Every DAL function that reads user-specific data must call `verifySession` or `requireSession`.
+
+Why: layouts in App Router can be cached and don't re-render on every navigation. A Server Action is reachable as a POST endpoint regardless of the page it came from. Defense in depth means the security check lives at the data source, not at the entrypoint.
+
+## Layouts are not the auth checkpoint
+
+```typescript
+// BAD - layout-only auth check
+// app/(dashboard)/layout.tsx
+import { redirect } from 'next/navigation';
+import { verifySession } from '@/lib/dal';
+
+export default async function DashboardLayout({ children }: { children: React.ReactNode }) {
+  const session = await verifySession();
+  if (!session) redirect('/login');
+  return <div>{children}</div>;
+}
+
+// app/(dashboard)/posts/page.tsx
+import { db } from '@/lib/db';
+export default async function PostsPage() {
+  // trusts the layout did the auth check - WRONG, layouts don't always re-render
+  const posts = await db.post.findMany();
+  return <PostList posts={posts} />;
+}
+```
+
+```typescript
+// CORRECT - DAL function re-verifies inside the data fetch
+// app/(dashboard)/posts/page.tsx
+import { getMyPosts } from '@/lib/dal/posts';
+export default async function PostsPage() {
+  const posts = await getMyPosts(); // requireSession runs inside
+  return <PostList posts={posts} />;
+}
+```
+
+The layout redirect is fine as an *optimistic* UX (avoids the flash of unauthenticated content), but it isn't the security boundary.
+
+## `taintUniqueValue` / `taintObjectReference` (still experimental)
+
+React's taint APIs throw if a tainted value reaches a Client Component prop. Use them for high-stakes secrets so an accidental Server-to-Client prop pass throws at runtime.
+
+```typescript
+// lib/dal/billing.ts
+import 'server-only';
+import { experimental_taintUniqueValue as taintUniqueValue } from 'react';
+
+const stripeKey = process.env.STRIPE_SECRET_KEY!;
+taintUniqueValue(
+  'Do not pass the Stripe secret key to the client',
+  process, // owner object (anything stable)
+  stripeKey
+);
+
+// Now `stripeKey` is tainted. If it ever appears in a Client Component prop,
+// React throws "Tainted value cannot be passed to a Client Component."
+```
+
+`taintObjectReference` taints an entire object reference. Use for full user rows (with email, hash, etc.) that should never reach the client even by accident.
+
+These APIs require the `experimental.taint` flag - verify against the changelog for your installed Next.js version before enabling.
+
+## Common mistakes
+
+- **Forgetting `import 'server-only'`.** A Client Component can import the DAL module and ship server code (or, worse, a secret) to the browser.
+- **Skipping `cache()` on `verifySession`.** Every component that calls it triggers a fresh cookie lookup + DB query. With 30 components in a render tree, that's 30 round trips.
+- **Calling `unstable_cache` for session memoization.** `unstable_cache` caches *across* requests. Two users hit the same cached entry.
+- **Returning raw DB rows.** Leaks every column. Always project + map to a DTO.
+- **DAL function that fetches without an auth check** when the data is user-scoped. The Server Component looks safe at the call site; the security hole is in the DAL function.
+- **Layout-only auth check.** Layouts don't always re-render. The DAL must re-verify.
+- **`verifySession` called in a Client Component.** It uses `cookies()` which is a Server-only API. Put session in a Server Component prop and pass the minimal needed info down.
+- **Coupling the DAL to the framework.** The DAL doesn't need to import `next/*` except for `cookies`/`headers`. Keep the DB queries portable.

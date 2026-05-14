@@ -1,0 +1,431 @@
+---
+description: "Next.js 16 Route Handlers (app/**/route.ts): named-export shape (GET/POST/PUT/DELETE/PATCH/OPTIONS/HEAD), async params (Promise in v16) and RouteContext<'/...'> typed helper after next typegen, NextResponse.json / redirect / custom headers / ReadableStream streaming, dynamic-by-default caching with 'use cache' opt-in, runtime selection (edge vs nodejs), CORS + OPTIONS preflight, Zod input validation, verifySession from the DAL inside the handler, rate limiting, webhook signature verification (raw body BEFORE JSON parse for HMAC). When to use Route Handlers vs Server Actions vs DAL direct calls."
+globs: ["**/route.ts", "**/route.js", "**/route.tsx"]
+---
+
+# Route Handlers
+
+Route Handlers are addressable HTTP endpoints in the App Router, defined as `app/<path>/route.ts` with named exports per HTTP method. They are for external HTTP callers: webhooks, public APIs, mobile clients, AI streaming responses, file uploads, RSS / sitemap-like custom XML.
+
+They are NOT a general-purpose way to fetch data inside your own app. See "When NOT to use" below.
+
+## When to use a Route Handler
+
+- **Third-party webhooks** (Stripe, GitHub, Slack, Linear, etc.) - the external service calls a URL with a POST.
+- **Public APIs** consumed by clients outside your Next.js app (mobile, partner integrations, browser extensions).
+- **File uploads / multipart bodies** with non-JSON content types.
+- **Streaming responses with custom headers** - AI streaming, Server-Sent Events, large CSV exports.
+- **Non-UI responses** - RSS feeds, custom XML, OAuth callback URLs, OG-image preview routes.
+- **Authentication callbacks** - OAuth provider redirects, magic-link verification.
+
+## When NOT to use a Route Handler (Vercel calls this an anti-pattern)
+
+### Don't fetch your own Route Handler from a Server Component
+
+Both run on the server. Calling `fetch('/api/posts')` from a Server Component makes a wasted HTTP round-trip to your own process.
+
+```typescript
+// BAD - Server Component calling its own API route
+export default async function Page() {
+  const res = await fetch(`${process.env.NEXT_PUBLIC_URL}/api/posts`); // wasteful
+  const posts = await res.json();
+  return <PostList posts={posts} />;
+}
+
+// CORRECT - call the data function directly
+import { getPosts } from '@/lib/dal/posts';
+export default async function Page() {
+  const posts = await getPosts(); // direct call, no network
+  return <PostList posts={posts} />;
+}
+```
+
+### Don't use Route Handlers for mutations triggered from React components
+
+Server Actions are the canonical mutation surface. They give you typed form bindings, automatic CSRF protection, `useActionState`, and integration with `revalidateTag` / `updateTag`. A Route Handler for "delete post button click" is the wrong shape.
+
+```typescript
+// BAD - POST /api/posts/delete from a Client Component
+'use client';
+async function handleDelete(id: string) {
+  await fetch('/api/posts/delete', { method: 'POST', body: JSON.stringify({ id }) });
+}
+
+// CORRECT - Server Action
+'use server';
+export async function deletePost(id: string) {
+  // ... auth + ownership check + DB write + revalidate
+}
+
+// In the Client Component
+'use client';
+import { deletePost } from './actions';
+<button onClick={() => deletePost(id)}>Delete</button>
+```
+
+## The named-export shape
+
+A `route.ts` file exports one async function per HTTP method it handles. Anything not exported gets a 405.
+
+```typescript
+// app/api/posts/route.ts
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+export async function GET(req: NextRequest) {
+  // ...
+}
+
+export async function POST(req: NextRequest) {
+  // ...
+}
+
+export async function PUT(req: NextRequest)    { /* ... */ }
+export async function PATCH(req: NextRequest)  { /* ... */ }
+export async function DELETE(req: NextRequest) { /* ... */ }
+export async function OPTIONS()                { /* ... */ }
+export async function HEAD(req: NextRequest)   { /* ... */ }
+```
+
+The handler can return:
+
+- A `NextResponse` (or plain `Response`)
+- A `ReadableStream`
+- A primitive that gets serialized (rare; prefer `NextResponse.json`)
+
+## Async `params` in v16
+
+Dynamic segments arrive as a Promise. Use the `RouteContext<'/...'>` typed helper after running `next typegen` once.
+
+```typescript
+// BAD - v15 shape, TypeError in v16
+export async function GET(
+  req: Request,
+  { params }: { params: { id: string } }
+) {
+  return NextResponse.json({ id: params.id });
+}
+
+// CORRECT - explicit Promise type
+export async function GET(
+  req: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params;
+  return NextResponse.json({ id });
+}
+
+// CORRECT (typed via next typegen)
+import type { RouteContext } from 'next';
+
+export async function GET(req: Request, ctx: RouteContext<'/users/[id]'>) {
+  const { id } = await ctx.params;
+  return NextResponse.json({ id });
+}
+```
+
+`searchParams` are not passed to Route Handlers as a separate argument. Parse them from the URL:
+
+```typescript
+export async function GET(req: NextRequest) {
+  const url = new URL(req.url);
+  const page = url.searchParams.get('page') ?? '1';
+  // ... or req.nextUrl.searchParams.get('page')
+}
+```
+
+## Responses
+
+```typescript
+import { NextResponse } from 'next/server';
+
+// JSON
+NextResponse.json({ ok: true });
+NextResponse.json({ error: 'Not found' }, { status: 404 });
+
+// Redirect
+NextResponse.redirect(new URL('/login', req.url));
+
+// Custom headers
+NextResponse.json(data, {
+  status: 200,
+  headers: {
+    'Cache-Control': 'public, s-maxage=60',
+    'X-Custom-Header': 'value',
+  },
+});
+
+// Plain text
+new NextResponse('hello', { status: 200, headers: { 'Content-Type': 'text/plain' } });
+```
+
+## Streaming responses
+
+For AI streaming, large exports, or Server-Sent Events, return a `ReadableStream`.
+
+```typescript
+export async function GET() {
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      for (let i = 0; i < 10; i++) {
+        controller.enqueue(encoder.encode(`event: tick\ndata: ${i}\n\n`));
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+    },
+  });
+}
+```
+
+For AI provider streaming (Anthropic, OpenAI), pipe the provider stream through. The Vercel AI SDK has helpers, but the raw shape above is fine.
+
+## Caching: dynamic by default
+
+Route Handlers are dynamic by default in v15+. To opt into caching:
+
+```typescript
+// Option A: 'use cache' directive (Cache Components enabled)
+import { cacheLife, cacheTag } from 'next/cache';
+
+export async function GET() {
+  'use cache';
+  cacheLife('hours');
+  cacheTag('prices');
+
+  const prices = await fetchPrices();
+  return NextResponse.json(prices);
+}
+
+// Option B: route-segment revalidate
+export const revalidate = 3600; // seconds
+
+export async function GET() {
+  const prices = await fetchPrices();
+  return NextResponse.json(prices);
+}
+```
+
+Don't cache:
+
+- Any handler that reads `cookies()` / `headers()` / per-user data
+- Webhook receivers
+- Mutation endpoints (POST/PUT/PATCH/DELETE)
+
+## Runtime selection
+
+```typescript
+// Node.js runtime (default) - full Node.js APIs available
+export const runtime = 'nodejs';
+
+// Edge runtime - geographically distributed, faster cold starts, restricted APIs
+export const runtime = 'edge';
+```
+
+When to use Edge:
+
+- Geographically sensitive workloads (geo-routing, A/B tests)
+- Very fast responses with no Node.js built-in needs
+- Streaming AI responses (low TTFB matters)
+
+What Edge bans (no exhaustive list - verify against your installed version):
+
+- Node.js built-ins: `fs`, `path`, `child_process`, full `crypto` (only Web Crypto subset)
+- Native modules / binary dependencies
+- Long-running operations (most Edge platforms cap at ~30s)
+- Many DB drivers (pg, mongodb native, Prisma without an Edge-compatible adapter)
+
+When in doubt, stay on `nodejs`. The cold-start difference matters for traffic shapes where Edge actually pays off.
+
+## CORS
+
+For Route Handlers consumed by external browser clients (your own SPA on a different domain, a partner's site), set CORS headers explicitly.
+
+```typescript
+// app/api/public/route.ts
+import { NextResponse } from 'next/server';
+
+const ALLOWED_ORIGIN = 'https://partner.example.com';
+
+export async function GET() {
+  return NextResponse.json(
+    { ok: true },
+    {
+      headers: {
+        'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      },
+    }
+  );
+}
+
+export async function OPTIONS() {
+  return new NextResponse(null, {
+    status: 204,
+    headers: {
+      'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Max-Age': '86400',
+    },
+  });
+}
+```
+
+Never set `Access-Control-Allow-Origin: *` together with `Access-Control-Allow-Credentials: true` - browsers reject the combination.
+
+## Input validation
+
+The handler receives a `Request`, not a `FormData` directly. Parse the body explicitly.
+
+```typescript
+import { z } from 'zod';
+
+const CreatePostSchema = z.object({
+  title: z.string().min(1).max(200),
+  body: z.string().min(1).max(50_000),
+});
+
+export async function POST(req: NextRequest) {
+  // For JSON bodies
+  let raw: unknown;
+  try {
+    raw = await req.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
+  }
+
+  const parsed = CreatePostSchema.safeParse(raw);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: 'Invalid input', issues: parsed.error.flatten().fieldErrors },
+      { status: 400 }
+    );
+  }
+
+  // ... rest
+}
+```
+
+For multipart / form-encoded bodies:
+
+```typescript
+export async function POST(req: NextRequest) {
+  const formData = await req.formData();
+  const file = formData.get('file');
+  if (!(file instanceof File)) {
+    return NextResponse.json({ error: 'No file' }, { status: 400 });
+  }
+  // ...
+}
+```
+
+## Authentication
+
+Route Handlers do NOT inherit auth from `proxy.ts`. Re-verify inside the handler using the same DAL function used everywhere else.
+
+```typescript
+import { verifySession } from '@/lib/dal';
+
+export async function POST(req: NextRequest) {
+  const session = await verifySession();
+  if (!session) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  // ... rest
+}
+```
+
+Don't trust headers set by the client. Don't trust `x-user-id`. Verify the session cookie via the DAL.
+
+## Rate limiting
+
+Same pattern as Server Actions. Public Route Handlers are particularly exposed.
+
+```typescript
+import { Ratelimit } from '@upstash/ratelimit';
+import { Redis } from '@upstash/redis';
+import { headers } from 'next/headers';
+
+const ratelimit = new Ratelimit({
+  redis: Redis.fromEnv(),
+  limiter: Ratelimit.slidingWindow(10, '1 m'),
+});
+
+export async function POST(req: NextRequest) {
+  const ip = (await headers()).get('x-forwarded-for')?.split(',')[0] ?? 'unknown';
+  const { success, remaining } = await ratelimit.limit(`api:${ip}`);
+  if (!success) {
+    return NextResponse.json(
+      { error: 'Too many requests' },
+      { status: 429, headers: { 'X-RateLimit-Remaining': String(remaining) } }
+    );
+  }
+  // ... rest
+}
+```
+
+## Webhook signature verification
+
+For webhook receivers (Stripe, GitHub, Slack), you must verify the HMAC signature BEFORE parsing the body as JSON. The signature is computed over the raw bytes; if you JSON-parse and re-stringify, you get different bytes and the signature will not match.
+
+```typescript
+// BAD - signature check after JSON parse
+export async function POST(req: NextRequest) {
+  const body = await req.json();             // raw bytes consumed
+  const sig = req.headers.get('stripe-signature');
+  // ... try to verify - body is already an object, signature mismatch
+}
+
+// CORRECT - read raw bytes first, then verify, THEN parse
+import Stripe from 'stripe';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!;
+
+export async function POST(req: NextRequest) {
+  const sig = req.headers.get('stripe-signature');
+  if (!sig) return NextResponse.json({ error: 'No signature' }, { status: 400 });
+
+  const rawBody = await req.text(); // raw string, NOT .json()
+
+  let event: Stripe.Event;
+  try {
+    event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
+  } catch (e) {
+    return NextResponse.json({ error: 'Invalid signature' }, { status: 400 });
+  }
+
+  // Now safe to use `event`
+  // ... handle event.type
+  return NextResponse.json({ received: true });
+}
+```
+
+Same pattern for GitHub webhooks (HMAC-SHA256 over the raw body), Slack signing secrets, Linear signatures, and most other webhook providers. The rule: raw bytes -> verify -> parse.
+
+## Common mistakes
+
+- **Fetching your own Route Handler from a Server Component.** Wasted round-trip. Call the DAL function directly.
+- **Returning raw DB rows.** Same DTO discipline as Server Actions. Project + map.
+- **No input validation.** The body could be anything. Parse with Zod / Valibot first.
+- **No auth check.** Route Handlers do not inherit `proxy.ts` auth. Call `verifySession` in the handler.
+- **Missing `OPTIONS` for CORS.** Preflight fails, browser rejects the cross-origin request.
+- **Parsing body before reading raw bytes for webhooks.** Signature check breaks. Read `req.text()` first.
+- **Forgetting `await` on `req.json()`.** Body parsing is async; the un-awaited Promise resolves to a Promise object, not the parsed value.
+- **`NextRequest` / `NextResponse` confusion** - both come from `next/server`, NOT from `next/navigation`. `next/navigation` is for `redirect`, `notFound`, `useRouter` (client).
+- **Sync `params` destructure.** v16 TypeError. Always `const { id } = await params`.
+- **`runtime = 'edge'` for handlers that use Node-only libs.** Build fails or runtime crashes. Default to `'nodejs'` unless you have a reason.
+- **No rate limit on public endpoints.** Free DoS vector. Rate limit by IP at minimum.
+- **`Access-Control-Allow-Origin: *` plus credentials.** Browsers reject. Use a specific origin or omit credentials.
+- **Webhook handler that re-uses the auth cookie check.** Webhooks don't have user sessions. Authenticate via the provider's signature, not your own auth.

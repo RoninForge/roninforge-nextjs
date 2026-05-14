@@ -1,7 +1,7 @@
 {
   "name": "roninforge-nextjs",
-  "version": "1.0.0",
-  "description": "Next.js 15 App Router rules, caching patterns, Server Actions, and anti-pattern detection for Cursor. Prevents Pages Router hallucinations and teaches async APIs, Server Components, and React 19 patterns.",
+  "version": "2.0.0",
+  "description": "Next.js 16 App Router rules for Cursor. Targets the 2025-10 release: Cache Components (replaces dynamicIO/ppr/useCache flags), proxy.ts (renamed from middleware.ts), async-only request APIs (cookies/headers/params/searchParams), revalidateTag(tag, profile) 2-arg, updateTag + refresh for Server Actions, Turbopack default, next lint removed, async params in image generators, parallel-route default.js required. Teaches the Data Access Layer pattern (Vercel's official 2025+ recommendation), Server Actions with Zod validation + DTO returns + redirect-outside-try-catch, useActionState + useFormStatus, three-layer auth (proxy optimistic, DAL secure, component re-verify), Route Handler vs Server Component decision tree, image/font/dynamic/Suspense performance, metadata API conventions. Catches 34 LLM regressions: Pages Router patterns, 'use client' on layouts, sync cookies(), useEffect+fetch for server data, useFormState (deprecated), single-arg revalidateTag, middleware.ts for new code, experimental.ppr/dynamicIO/useCache flags, redirect() inside try/catch, fetching own Route Handler from Server Component, missing default.js in parallel routes, images.domains, NEXT_PUBLIC_ env leakage, no input validation in Server Actions.",
   "author": {
     "name": "RoninForge",
     "url": "https://roninforge.org"
@@ -12,12 +12,14 @@
   "keywords": [
     "nextjs",
     "next",
+    "next.js",
     "react",
+    "react-19",
     "app-router",
     "server-components",
     "server-actions",
-    "caching",
-    "react-19",
-    "typescript"
+    "cache-components",
+    "typescript",
+    "anti-patterns"
   ]
 }
