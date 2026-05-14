@@ -1,26 +1,26 @@
-// Anti-pattern: 'use client' on page for data that should be server-fetched
-'use client';
+// Anti-pattern sample. DO NOT use as a template.
+// Violations:
+// 1. Sync cookies() (TypeError in v16, cookies() returns Promise)
+// 2. Sync params destructure (TypeError in v16, params is Promise<{...}>)
+// 3. Hardcoded NEXT_PUBLIC_API_SECRET (secrets behind NEXT_PUBLIC_ are inlined into the client bundle)
+// 4. Function is not async despite reading async-only request APIs
 
-import { useState, useEffect } from 'react';
-import { useRouter } from 'next/router'; // Anti-pattern: Pages Router import
+import { cookies } from 'next/headers';
 
-export default function HomePage() {
-  // Anti-pattern: useEffect + fetch for server-available data
-  const [posts, setPosts] = useState([]);
+type PageProps = { params: { locale: string }; searchParams: { ref?: string } };
 
-  useEffect(() => {
-    // Anti-pattern: fetching own Route Handler from client
-    fetch('/api/posts')
-      .then(res => res.json())
-      .then(setPosts);
-  }, []);
+export default function HomePage({ params, searchParams }: PageProps) {
+  const theme = cookies().get('theme')?.value ?? 'light';
+  const ref = searchParams.ref ?? 'direct';
+
+  const apiKey = process.env.NEXT_PUBLIC_API_SECRET;
+  fetch(`https://api.example.com/visits?ref=${ref}`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
 
   return (
-    <div>
-      <h1>Posts</h1>
-      {posts.map((post: any) => (
-        <div key={post.id}>{post.title}</div>
-      ))}
-    </div>
+    <main data-theme={theme}>
+      <h1>Home ({params.locale})</h1>
+    </main>
   );
 }

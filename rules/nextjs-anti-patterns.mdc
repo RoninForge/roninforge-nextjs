@@ -1,0 +1,771 @@
+---
+description: "Next.js 16 anti-pattern detector. Catches 2023-era Pages Router hallucinations (getServerSideProps, getStaticProps, pages/api), 'use client' on layouts/pages, useEffect+fetch for server data, sync cookies/headers/params (now async-only in v16), useFormState (deprecated, use useActionState), single-arg revalidateTag (deprecated, requires profile in v16), middleware.ts for new code (renamed to proxy.ts), experimental.ppr/dynamicIO/useCache flags (subsumed by cacheComponents), redirect() inside try/catch (silently swallowed), fetching own Route Handler from Server Component, Server Action without input validation, returning raw DB rows from Server Actions, mass assignment (NEXT_PUBLIC_ env leakage), missing default.js in parallel routes, images.domains (deprecated), next/legacy/image, next lint command (removed), serverRuntimeConfig/publicRuntimeConfig (removed), images quality without coercion to images.qualities, ad-hoc revalidatePath over tag-scoped revalidateTag/updateTag, auth check only in layout (partial-render bypass), IDOR in Server Actions, missing useFormStatus for pending state, custom webpack config without --webpack flag."
+alwaysApply: true
+---
+
+# Next.js 16 Anti-Patterns
+
+Reject these in generated code. Each entry has a BAD example and the CORRECT replacement. Severity tags map to the reviewer agent's grouping.
+
+> Target: `next` 16.0+ on `react` 19.2+. Many of these patterns were valid in earlier versions and the LLM may have learned them from 2023-2024 training data. The "Replaced in" / "Removed in" tags on each entry tell you when the BAD form stopped working.
+
+## 1. `getServerSideProps` / `getStaticProps` / `getInitialProps` **CRITICAL**
+
+Pages Router data-fetching APIs. They do not exist in App Router.
+
+```typescript
+// BAD - Pages Router, will not run in App Router
+export async function getServerSideProps() {
+  return { props: { posts: await fetchPosts() } };
+}
+export default function Page({ posts }: { posts: Post[] }) { /* ... */ }
+
+// CORRECT - async Server Component fetches directly
+export default async function Page() {
+  const posts = await fetchPosts();
+  return <PostList posts={posts} />;
+}
+```
+
+`pages/api/*.ts` Route handlers are also Pages Router. Use `app/api/<path>/route.ts` with named-export `GET`/`POST`/etc.
+
+## 2. `'use client'` on a layout or page **ERROR**
+
+A `'use client'` directive at the top of a layout or page makes the entire subtree client-rendered. You lose Server Components for everything below.
+
+```typescript
+// BAD - this layout forces every page underneath to be client
+'use client';
+export default function Layout({ children }: { children: React.ReactNode }) {
+  return <div>{children}</div>;
+}
+
+// CORRECT - keep the layout server-side, extract the interactive sliver
+// app/(dashboard)/layout.tsx (Server Component, no directive)
+export default function Layout({ children }: { children: React.ReactNode }) {
+  return (
+    <div>
+      <Sidebar /> {/* small Client Component for interactivity */}
+      <main>{children}</main>
+    </div>
+  );
+}
+
+// app/(dashboard)/_components/sidebar.tsx
+'use client';
+export function Sidebar() { /* useState, onClick, etc. */ }
+```
+
+Push `'use client'` as far down the tree as possible. The directive sets a *boundary* - everything imported from that file forward is client.
+
+## 3. `useEffect` + `fetch` for server data **ERROR**
+
+Client-side fetch in a `useEffect` for data that has no per-user interactive reason to live on the client. Doubles the trip (server -> HTML -> client -> fetch -> hydrate) and loses streaming.
+
+```typescript
+// BAD
+'use client';
+export function Posts() {
+  const [posts, setPosts] = useState<Post[]>([]);
+  useEffect(() => {
+    fetch('/api/posts').then(r => r.json()).then(setPosts);
+  }, []);
+  return <PostList posts={posts} />;
+}
+
+// CORRECT - Server Component, fetch happens during render
+export default async function Posts() {
+  const posts = await fetchPosts(); // direct DB or DAL call
+  return <PostList posts={posts} />;
+}
+```
+
+Use SWR/TanStack Query for genuinely client-side dynamic data (live polling, mutation-driven cache, optimistic updates). For "load once on render," it's a Server Component.
+
+## 4. Sync `cookies()` / `headers()` / `draftMode()` **CRITICAL**
+
+These have been async since Next.js 15. In v16 the sync form is fully removed - direct access is a TypeScript error.
+
+```typescript
+// BAD - TypeError in v16
+import { cookies } from 'next/headers';
+export default function Page() {
+  const theme = cookies().get('theme')?.value;
+  return <div data-theme={theme}>...</div>;
+}
+
+// CORRECT
+import { cookies } from 'next/headers';
+export default async function Page() {
+  const cookieStore = await cookies();
+  const theme = cookieStore.get('theme')?.value;
+  return <div data-theme={theme}>...</div>;
+}
+```
+
+Same shape for `headers()` and `draftMode()`. Codemod available: `npx @next/codemod@canary upgrade latest`.
+
+## 5. Sync `params` / `searchParams` **CRITICAL**
+
+Page, layout, and route-handler `params` and `searchParams` are Promises in v16.
+
+```typescript
+// BAD - TypeError in v16
+export default function Page({ params }: { params: { slug: string } }) {
+  return <article>{params.slug}</article>;
+}
+
+// CORRECT
+export default async function Page({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params;
+  return <article>{slug}</article>;
+}
+
+// CORRECT (typed via next typegen) - run `next typegen` once
+import type { PageProps } from 'next';
+export default async function Page({ params }: PageProps<'/blog/[slug]'>) {
+  const { slug } = await params;
+  return <article>{slug}</article>;
+}
+```
+
+`generateMetadata`, `route.ts` handlers, and `opengraph-image.tsx` generators all receive async `params` too. The `id` in `generateImageMetadata` is also async in v16 (was sync in v15).
+
+## 6. `fetch()` cached by default assumption **ERROR**
+
+Starting with Next.js 15, `fetch()` is **not** cached by default. With `cacheComponents: true` enabled (v16), nothing is cached unless you opt in via the `'use cache'` directive, `cacheLife`, or `cacheTag`.
+
+```typescript
+// BAD - assumes 14.x cached-by-default behavior, gets fresh fetches every time
+async function getPrices() {
+  const res = await fetch('https://api.example.com/prices');
+  return res.json();
+}
+
+// CORRECT - opt in to cache explicitly
+async function getPrices() {
+  'use cache';
+  cacheLife('hours');
+  cacheTag('prices');
+  const res = await fetch('https://api.example.com/prices');
+  return res.json();
+}
+
+// OR - per-call revalidate
+async function getPrices() {
+  const res = await fetch('https://api.example.com/prices', {
+    next: { revalidate: 3600, tags: ['prices'] },
+  });
+  return res.json();
+}
+```
+
+## 7. `useFormState` (deprecated) **ERROR**
+
+Renamed to `useActionState` in React 19 and moved from `react-dom` to `react`. The signature gained a third tuple element for pending state.
+
+```typescript
+// BAD - deprecated since React 19
+import { useFormState } from 'react-dom';
+const [state, formAction] = useFormState(action, initialState);
+
+// CORRECT - React 19+
+import { useActionState } from 'react';
+const [state, formAction, isPending] = useActionState(action, initialState);
+```
+
+`experimental_useFormState` was never stable - same fix.
+
+## 8. Missing `useFormStatus` for pending UI on submit buttons **WARN**
+
+`useActionState` gives you the *result* pending state. For visual feedback on the submit button itself (especially when the button is a child component), use `useFormStatus`. It still lives in `react-dom` and only works inside a child of a `<form>`.
+
+```typescript
+// BAD - no pending indicator, user double-clicks submit
+'use client';
+export function SubmitButton() {
+  return <button type="submit">Save</button>;
+}
+
+// CORRECT
+'use client';
+import { useFormStatus } from 'react-dom';
+export function SubmitButton() {
+  const { pending } = useFormStatus();
+  return (
+    <button type="submit" disabled={pending}>
+      {pending ? 'Saving...' : 'Save'}
+    </button>
+  );
+}
+```
+
+## 9. `revalidateTag(tag)` single-arg form **ERROR**
+
+In v16 the recommended form of `revalidateTag` takes a cache profile as the second argument (a name like `'max'` / `'hours'` / `'days'`, or an inline `{ expire: number }`). The single-arg form is deprecated. Depending on your installed patch and TS settings it surfaces as either a TypeScript error or a runtime deprecation - treat it as an error and always pass the profile.
+
+```typescript
+// BAD - deprecated in v16
+revalidateTag('posts');
+
+// CORRECT - explicit profile
+revalidateTag('posts', 'max');                  // never expires after refresh
+revalidateTag('posts', { expire: 3600 });       // inline override
+
+// ALTERNATIVE - within a Server Action where you want read-your-writes
+updateTag('posts'); // expires + refreshes within the same request
+```
+
+## 10. `middleware.ts` for new code **WARN**
+
+The middleware file was renamed `proxy.ts` in v16, with the named export changing from `middleware` to `proxy`. `middleware.ts` still works for the Edge runtime use case but is deprecated. `proxy.ts` runs on the Node.js runtime only.
+
+```typescript
+// BAD (new code) - middleware.ts
+// middleware.ts
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+export function middleware(req: NextRequest) {
+  return NextResponse.next();
+}
+
+// CORRECT - proxy.ts
+// proxy.ts
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+export function proxy(req: NextRequest) {
+  return NextResponse.next();
+}
+```
+
+Config flag renamed too: `skipMiddlewareUrlNormalize` → `skipProxyUrlNormalize`. See the `nextjs-proxy-and-auth` rule for the full pattern.
+
+## 11. `experimental.ppr` / `experimental.dynamicIO` / `experimental.useCache` flags **ERROR**
+
+All three were collapsed into the single top-level `cacheComponents: true` flag in v16. Setting any of the old flags is now a config error.
+
+```typescript
+// BAD - v15 experimental flags
+// next.config.ts
+const config = {
+  experimental: { ppr: true, dynamicIO: true, useCache: true },
+};
+
+// CORRECT - v16
+const config = {
+  cacheComponents: true,
+};
+```
+
+The route-level `export const experimental_ppr = true` directive is also removed. Cache Components is the unified opt-in.
+
+## 12. `redirect()` inside `try / catch` **CRITICAL**
+
+`redirect()` works by throwing `NEXT_REDIRECT`. A `try / catch` block intercepts that throw and the redirect silently dies.
+
+```typescript
+// BAD - the catch swallows the redirect throw
+'use server';
+export async function createPost(formData: FormData) {
+  try {
+    await db.post.create({ data: { /* ... */ } });
+    redirect('/posts');  // <-- thrown, then caught below
+  } catch (e) {
+    console.error(e);    // logs "NEXT_REDIRECT", nothing happens
+  }
+}
+
+// CORRECT - call redirect AFTER the try/catch returns successfully
+'use server';
+export async function createPost(formData: FormData) {
+  try {
+    await db.post.create({ data: { /* ... */ } });
+  } catch (e) {
+    console.error(e);
+    return { error: 'Failed to create post' };
+  }
+  redirect('/posts'); // outside try/catch, throws cleanly
+}
+```
+
+If you must catch other throws, re-throw any error whose message matches `NEXT_(REDIRECT|NOT_FOUND)` - see the catch-narrowing pattern in the `nextjs-error-handling` rule. Do NOT import `isRedirectError` from `next/dist/...` - it is not a stable public API.
+
+## 13. Server Action without input validation **CRITICAL**
+
+Server Actions are reachable as POST endpoints. `FormData` values are always strings. Never trust the shape.
+
+```typescript
+// BAD - assumes the form posted the right fields and types
+'use server';
+export async function updateProfile(formData: FormData) {
+  await db.user.update({
+    where: { id: formData.get('id') as string },
+    data: { name: formData.get('name') as string },
+  });
+}
+
+// CORRECT - validate with Zod, return errors as state
+'use server';
+import { z } from 'zod';
+
+const UpdateProfileSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string().min(1).max(80),
+});
+
+export async function updateProfile(_prev: State, formData: FormData) {
+  const parsed = UpdateProfileSchema.safeParse({
+    id: formData.get('id'),
+    name: formData.get('name'),
+  });
+  if (!parsed.success) {
+    return { errors: parsed.error.flatten().fieldErrors };
+  }
+  // ... DAL call (which re-checks auth + ownership)
+}
+```
+
+`next-safe-action` and `zsa` are popular community wrappers. The shape they enforce is the same: parse, then act.
+
+## 14. Server Action without authorization re-check **CRITICAL**
+
+Page-level auth in a layout or `proxy.ts` does NOT protect the Server Action. Actions are independent POST endpoints reachable by URL. Always re-verify identity *and* resource ownership inside the action.
+
+```typescript
+// BAD - action trusts the page-level auth, never checks ownership
+'use server';
+export async function deletePost(postId: string) {
+  await db.post.delete({ where: { id: postId } }); // IDOR: any logged-in user can delete any post
+}
+
+// CORRECT - verify session AND ownership
+'use server';
+import { verifySession } from '@/lib/dal';
+export async function deletePost(postId: string) {
+  const session = await verifySession();
+  if (!session) throw new Error('Unauthorized');
+
+  const post = await db.post.findUnique({ where: { id: postId } });
+  if (!post || post.authorId !== session.userId) {
+    throw new Error('Forbidden');
+  }
+
+  await db.post.delete({ where: { id: postId } });
+}
+```
+
+See `nextjs-data-access-layer` rule for the cached `verifySession()` pattern.
+
+## 15. Returning raw DB records from a Server Action **ERROR**
+
+Action return values are serialized to the client. Return only what the UI needs - never raw DB rows with internal IDs, password hashes, soft-delete flags, etc.
+
+```typescript
+// BAD - returns the entire user row including passwordHash, isAdmin, audit fields
+'use server';
+export async function updateName(formData: FormData) {
+  const user = await db.user.update({ /* ... */ });
+  return user;
+}
+
+// CORRECT - return a DTO
+'use server';
+type UserDTO = { id: string; name: string; updatedAt: string };
+export async function updateName(formData: FormData): Promise<UserDTO> {
+  const user = await db.user.update({ /* ... */ });
+  return { id: user.id, name: user.name, updatedAt: user.updatedAt.toISOString() };
+}
+```
+
+DTOs are the project's API contract with the client. Don't leak the schema.
+
+## 16. Fetching your own Route Handler from a Server Component **WARN**
+
+Server Components run on the server. `fetch('/api/foo')` from inside one makes a wasteful HTTP round-trip to your own process. Call the data function directly.
+
+```typescript
+// BAD
+export default async function Page() {
+  const res = await fetch(`${process.env.NEXT_PUBLIC_URL}/api/posts`); // round-trip
+  const posts = await res.json();
+  return <PostList posts={posts} />;
+}
+
+// CORRECT - call the underlying function directly
+import { getPosts } from '@/lib/dal/posts';
+export default async function Page() {
+  const posts = await getPosts(); // direct call, no network
+  return <PostList posts={posts} />;
+}
+```
+
+Route Handlers are for external callers (webhooks, public APIs, mobile, AI streaming). Internal data goes through the DAL.
+
+## 17. Mutation without revalidation **ERROR**
+
+After a Server Action mutates data, the cached UI needs to refresh. `revalidatePath` for path-scoped, `revalidateTag(tag, profile)` for tag-scoped, or `updateTag(tag)` for read-your-writes within the same request.
+
+```typescript
+// BAD - data changes but the page still shows the stale cache
+'use server';
+export async function createPost(formData: FormData) {
+  await db.post.create({ /* ... */ });
+  redirect('/posts'); // /posts is still serving the stale cache
+}
+
+// CORRECT - bust the cache before navigating
+'use server';
+export async function createPost(formData: FormData) {
+  await db.post.create({ /* ... */ });
+  revalidateTag('posts', 'max');
+  redirect('/posts');
+}
+
+// ALTERNATIVE - read-your-writes within the same response
+'use server';
+export async function createPost(formData: FormData) {
+  await db.post.create({ /* ... */ });
+  updateTag('posts'); // expires + refreshes inline
+  return { ok: true }; // no redirect, UI sees fresh data
+}
+```
+
+## 18. Missing `default.js` in a parallel route slot **ERROR**
+
+Parallel routes (`@modal`, `@sidebar`) require a `default.js` for each slot. Without it, navigation to a route that doesn't define content for that slot triggers a 404 in v16 (was a soft warning in v15).
+
+```typescript
+// REQUIRED FILE STRUCTURE
+app/
+  layout.tsx           // accepts { children, modal } props
+  page.tsx
+  @modal/
+    default.tsx        // <-- REQUIRED in v16
+    (.)photos/
+      [id]/
+        page.tsx
+```
+
+```typescript
+// app/@modal/default.tsx
+export default function Default() {
+  return null; // empty slot is fine, the file just has to exist
+}
+```
+
+## 19. `next/legacy/image` import **WARN**
+
+`next/legacy/image` was the v11 transitional adapter and is deprecated. Use `next/image`.
+
+```typescript
+// BAD
+import Image from 'next/legacy/image';
+
+// CORRECT
+import Image from 'next/image';
+```
+
+## 20. `images.domains` config **WARN**
+
+Replaced by `images.remotePatterns` in v15, fully deprecated in v16. `remotePatterns` is more precise (host + path + port + protocol).
+
+```typescript
+// BAD - next.config.ts
+const config = {
+  images: { domains: ['cdn.example.com'] },
+};
+
+// CORRECT
+const config = {
+  images: {
+    remotePatterns: [
+      { protocol: 'https', hostname: 'cdn.example.com', pathname: '/images/**' },
+    ],
+  },
+};
+```
+
+## 21. `images.quality` value outside `images.qualities` **ERROR**
+
+In v16 the `quality` prop on `<Image>` is coerced to the nearest value in `images.qualities` config (default `[75]`). A `quality={90}` falls back to 75 silently. Either configure `images.qualities` or stop hardcoding non-75 values.
+
+```typescript
+// CONTEXT - default config
+// next.config.ts has no images.qualities, defaults to [75]
+
+// BAD - silently coerced to 75
+<Image src="/hero.jpg" alt="Hero" quality={90} width={1200} height={600} />
+
+// CORRECT (option A) - widen the allowed qualities
+const config = {
+  images: { qualities: [50, 75, 90] },
+};
+
+// CORRECT (option B) - drop the prop, use the default
+<Image src="/hero.jpg" alt="Hero" width={1200} height={600} />
+```
+
+## 22. Hardcoded `NEXT_PUBLIC_*` env for secrets **CRITICAL**
+
+Any env var prefixed `NEXT_PUBLIC_` is inlined into the client bundle at build time. A secret with that prefix is shipped to every browser.
+
+```typescript
+// BAD - bundled into the client JS, visible in DevTools
+const stripeKey = process.env.NEXT_PUBLIC_STRIPE_SECRET_KEY;
+
+// CORRECT - server-only, never bundled
+// (consumed from a Server Component, Server Action, or Route Handler only)
+const stripeKey = process.env.STRIPE_SECRET_KEY;
+```
+
+Add `import 'server-only'` to the file that reads server secrets to throw at build time if a Client Component ever imports it.
+
+## 23. `serverRuntimeConfig` / `publicRuntimeConfig` **ERROR**
+
+Removed in v16. Use `process.env.*` directly. For runtime-read (i.e. read at request time, not build time), wrap the read in `await connection()` first to opt the segment out of static optimisation. `connection` is imported from `next/server`.
+
+```typescript
+// BAD
+import getConfig from 'next/config';
+const { serverRuntimeConfig } = getConfig();
+const apiKey = serverRuntimeConfig.API_KEY;
+
+// CORRECT
+const apiKey = process.env.API_KEY;
+
+// CORRECT (runtime-read, opt out of static optimisation)
+import { connection } from 'next/server';
+export async function getApiKey() {
+  await connection();
+  return process.env.API_KEY!;
+}
+```
+
+## 24. `next lint` command **WARN**
+
+Removed in v16. Run ESLint or Biome directly via `package.json` scripts.
+
+```json
+// BAD - package.json
+{ "scripts": { "lint": "next lint" } }
+
+// CORRECT
+{ "scripts": { "lint": "eslint . --max-warnings=0" } }
+```
+
+Codemod: `npx @next/codemod@latest next-lint-to-eslint-cli`.
+
+## 25. Custom `webpack` config without `--webpack` flag **ERROR**
+
+Turbopack is the default bundler in v16. A custom `webpack` config in `next.config` causes `next build` to fail unless you explicitly opt in to webpack.
+
+```typescript
+// BAD - this fails next build in v16
+const config = {
+  webpack: (config) => { /* ... */ return config; },
+};
+```
+
+```jsonc
+// CORRECT (option A) - explicitly use webpack
+// package.json
+{ "scripts": { "build": "next build --webpack" } }
+```
+
+```typescript
+// CORRECT (option B) - migrate the customization to turbopack config
+const config = {
+  turbopack: {
+    resolveAlias: { /* ... */ },
+    rules: { /* ... */ },
+  },
+};
+```
+
+## 26. `'use client'` library imported by a Server Component just for one prop **WARN**
+
+When you put `'use client'` on a wrapper component and import it from a Server Component, the wrapper plus its entire transitive client-graph ships to every visitor. Push the boundary closer to the actual interactivity.
+
+```typescript
+// BAD - <Hero> is a Client Component just so the CTA can be onClick
+'use client';
+export function Hero({ title, ctaLabel }: Props) {
+  return (
+    <section>
+      <h1>{title}</h1>
+      <button onClick={() => track('cta')}>{ctaLabel}</button>
+    </section>
+  );
+}
+
+// CORRECT - Hero stays a Server Component, only the button is client
+// hero.tsx (Server Component)
+import { TrackedButton } from './tracked-button';
+export function Hero({ title, ctaLabel }: Props) {
+  return (
+    <section>
+      <h1>{title}</h1>
+      <TrackedButton label={ctaLabel} />
+    </section>
+  );
+}
+
+// tracked-button.tsx
+'use client';
+export function TrackedButton({ label }: { label: string }) {
+  return <button onClick={() => track('cta')}>{label}</button>;
+}
+```
+
+## 27. React Context for auth/session in Server Components **ERROR**
+
+React Context doesn't work in Server Components. A `<SessionProvider value={...}>` wrapping a Server Component child does NOT propagate. The server child renders without the context, producing wrong (or null) data.
+
+```typescript
+// BAD - context never reaches the Server Component child
+'use client';
+const SessionContext = createContext<Session | null>(null);
+
+// Then somewhere:
+<SessionProvider value={session}>
+  <ServerDashboard /> {/* server child, no context */}
+</SessionProvider>
+
+// CORRECT - read session in the Server Component directly
+import { verifySession } from '@/lib/dal';
+export default async function ServerDashboard() {
+  const session = await verifySession();
+  if (!session) redirect('/login');
+  return <Dashboard userId={session.userId} />;
+}
+```
+
+For Client Components, use the React Context pattern - just make sure the provider wraps only Client Component children.
+
+## 28. `error.tsx` wrapping a `layout.tsx` **ERROR**
+
+`error.tsx` does NOT catch errors thrown by the sibling `layout.tsx` - it only catches errors from `page.tsx` and below. To catch layout errors, use `error.tsx` one segment higher, or `global-error.tsx` at the root.
+
+```
+// FILE STRUCTURE - what each error boundary catches
+app/
+  layout.tsx                  <-- root layout errors -> global-error.tsx
+  global-error.tsx
+  dashboard/
+    layout.tsx                <-- this layout's errors -> caught by parent /app error.tsx OR global-error.tsx
+    error.tsx                 <-- catches page.tsx + children's errors, but NOT the layout above it
+    page.tsx
+```
+
+LLMs often place `error.tsx` next to a `layout.tsx` and expect it to catch layout-throwing code. It won't.
+
+## 29. `cookies().set(...)` during render **ERROR**
+
+Setting cookies during render is forbidden. You can only mutate cookies in a Server Action, Route Handler, or `proxy.ts`.
+
+```typescript
+// BAD - throws "Cookies can only be modified in a Server Action or Route Handler"
+export default async function Page() {
+  const cookieStore = await cookies();
+  cookieStore.set('seen', '1');  // <-- forbidden during render
+  return <div>...</div>;
+}
+
+// CORRECT - set the cookie inside a Server Action triggered by a form
+'use server';
+export async function markSeen() {
+  const cookieStore = await cookies();
+  cookieStore.set('seen', '1');
+}
+```
+
+## 30. `useEffect`-based redirects from Client Components for auth gating **WARN**
+
+```typescript
+// BAD - flash of unauthenticated content
+'use client';
+import { useRouter } from 'next/navigation';
+export function ProtectedPage() {
+  const router = useRouter();
+  useEffect(() => {
+    if (!session) router.push('/login');
+  }, []);
+  return <Dashboard />;
+}
+
+// CORRECT - server-side redirect, no flash
+import { redirect } from 'next/navigation';
+import { verifySession } from '@/lib/dal';
+export default async function ProtectedPage() {
+  const session = await verifySession();
+  if (!session) redirect('/login');
+  return <Dashboard />;
+}
+```
+
+## 31. Importing `Page` types from `next/router` **CRITICAL**
+
+`next/router` is Pages Router only. App Router uses `next/navigation` (`useRouter`, `usePathname`, `useSearchParams`, `redirect`, `notFound`).
+
+```typescript
+// BAD
+import { useRouter } from 'next/router';
+
+// CORRECT
+import { useRouter } from 'next/navigation'; // client
+import { redirect } from 'next/navigation';  // server
+```
+
+`router.push` / `router.replace` still exist on the App Router `useRouter`. `router.events` and `router.query` do NOT - those were Pages Router.
+
+## 32. Sass tilde imports `~bootstrap/...` **WARN**
+
+Turbopack does not support webpack's tilde-import resolver. Use the standard relative or `@import` path.
+
+```scss
+// BAD - works under webpack, not Turbopack
+@import "~bootstrap/scss/bootstrap";
+
+// CORRECT
+@import "bootstrap/scss/bootstrap"; // resolved via node_modules
+```
+
+If you must keep webpack, run with `next build --webpack`.
+
+## 33. Sync `id` in `generateImageMetadata` callbacks **ERROR**
+
+In v16, the `id` parameter passed to image-metadata callbacks (used with `generateImageMetadata`) is a Promise. Pre-v16 it was a string.
+
+```typescript
+// BAD - v15 shape
+export default function OG({ id }: { id: string }) {
+  return new ImageResponse(<div>{id}</div>);
+}
+
+// CORRECT - v16
+export default async function OG({ id }: { id: Promise<string> }) {
+  const resolved = await id;
+  return new ImageResponse(<div>{resolved}</div>);
+}
+```
+
+`params` in the same callback was already async in v15; v16 brought `id` into line.
+
+## 34. `experimental.taint` flag for `taintUniqueValue` / `taintObjectReference` **SUGGESTION**
+
+`taintUniqueValue` and `taintObjectReference` from `react` (not `next`) are powerful guards against accidentally passing server-only secrets to Client Components. They are still gated behind `experimental.taint` as of v16.2.x - verify against the changelog for your installed version before enabling. Use them for high-stakes values: session tokens, API secrets, full user rows.
+
+```typescript
+// USAGE
+import { experimental_taintUniqueValue as taintUniqueValue } from 'react';
+import 'server-only';
+
+const token = process.env.STRIPE_SECRET_KEY!;
+taintUniqueValue(
+  'Do not pass the Stripe secret key to the client',
+  process, // or any owner object
+  token
+);
+```
+
+If the value ever reaches `JSON.stringify` for a Client Component prop, React throws.

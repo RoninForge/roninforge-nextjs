@@ -1,0 +1,306 @@
+---
+description: "Next.js 16 Cache Components: 'use cache' directive, cacheLife profiles, cacheTag for invalidation, revalidateTag(tag, profile) 2-arg form (single-arg is deprecated), updateTag for read-your-writes within Server Actions, refresh() for uncached data, the cacheComponents flag replacing experimental.ppr / dynamicIO / useCache. When to cache (computed values, fetch results, expensive renders), when NOT to (per-request user data, secrets, anything sensitive to staleness). Migrating from v15 unstable_cache / fetch cache options."
+globs: ["**/next.config.ts", "**/next.config.js", "**/next.config.mjs", "app/**/page.tsx", "app/**/layout.tsx", "app/**/route.ts", "app/**/actions.ts", "**/lib/dal/**/*.ts"]
+---
+
+# Cache Components
+
+Next.js 16's unified caching model. Enable with one flag, then opt routes / functions / components into caching with the `'use cache'` directive.
+
+## Enable Cache Components
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next';
+
+const config: NextConfig = {
+  cacheComponents: true,
+};
+
+export default config;
+```
+
+With `cacheComponents: true`:
+
+- **Everything is dynamic by default.** Fetches do not cache. Server Components re-render every request.
+- **You opt in to caching** by adding `'use cache'` at the function, component, or file level.
+- **PPR (Partial Prerendering) runs as an internal mechanism** - no longer a user-facing flag.
+- The old flags `experimental.ppr`, `experimental.dynamicIO`, `experimental.useCache` are all subsumed. Setting them is a config error in v16.
+
+## `'use cache'` directive
+
+Place at the top of a function, component, or file. Cached output is keyed on the function's serializable arguments and the closure it captures.
+
+```typescript
+// Function-level: this function's return value is cached
+import 'server-only';
+import { cacheLife, cacheTag } from 'next/cache';
+
+export async function getProducts() {
+  'use cache';
+  cacheLife('hours');
+  cacheTag('products');
+
+  const res = await fetch('https://api.example.com/products');
+  return res.json();
+}
+```
+
+```typescript
+// Component-level: the rendered output is cached
+import { cacheLife, cacheTag } from 'next/cache';
+
+export async function ProductList({ category }: { category: string }) {
+  'use cache';
+  cacheLife('hours');
+  cacheTag(`products-${category}`);
+
+  const products = await db.product.findMany({ where: { category } });
+  return (
+    <ul>
+      {products.map(p => <li key={p.id}>{p.name}</li>)}
+    </ul>
+  );
+}
+```
+
+```typescript
+// File-level: every export from this file is cached
+'use cache';
+// ... exports below all share the directive
+```
+
+## `cacheLife` profiles
+
+Built-in named profiles plus inline override. Use named profiles in 95% of cases; named profiles compose well with `revalidateTag` and are visible in the DevTools cache panel.
+
+| Profile | Stale | Revalidate | Expire |
+|---|---|---|---|
+| `'seconds'` | 0s | 1s | 1s |
+| `'minutes'` | 0s | 60s | 1h |
+| `'hours'` | 60s | 1h | 1d |
+| `'days'` | 1h | 1d | 1w |
+| `'weeks'` | 1d | 1w | 1mo |
+| `'max'` | 5m | 1mo | never |
+
+```typescript
+import { cacheLife } from 'next/cache';
+
+async function getPrices() {
+  'use cache';
+  cacheLife('minutes');
+  // ...
+}
+
+// Inline (escape hatch for non-standard intervals)
+async function getStockTicker() {
+  'use cache';
+  cacheLife({ stale: 0, revalidate: 30, expire: 60 });
+  // ...
+}
+```
+
+Definitions:
+
+- **stale**: client treats result as fresh without a re-fetch for this long.
+- **revalidate**: server kicks off a background regeneration after this long.
+- **expire**: entry is removed; the next request renders cold.
+
+## `cacheTag`
+
+Tags let you bust caches by topic instead of path. A single function can carry multiple tags.
+
+```typescript
+async function getMyPosts(userId: string) {
+  'use cache';
+  cacheLife('hours');
+  cacheTag('posts');
+  cacheTag(`posts-user-${userId}`);
+
+  return db.post.findMany({ where: { authorId: userId } });
+}
+```
+
+Invalidate later:
+
+```typescript
+'use server';
+import { revalidateTag, updateTag } from 'next/cache';
+
+export async function createPost(/* ... */) {
+  await db.post.create({ /* ... */ });
+
+  // option A: out-of-band invalidation (next request re-renders fresh)
+  revalidateTag('posts', 'max');
+
+  // option B: read-your-writes within the same request
+  updateTag('posts');
+
+  return { ok: true };
+}
+```
+
+## `revalidateTag(tag, profile)` - the 2-arg requirement
+
+In v16, the recommended form of `revalidateTag` takes a cache profile as the second argument. The single-arg form (`revalidateTag('posts')`) is deprecated. Depending on your exact installed v16 patch and your TypeScript settings, calling it with one argument is either a TypeScript error or a runtime deprecation warning. Treat it as an error and always pass the profile.
+
+```typescript
+// BAD - deprecated, TS error
+revalidateTag('posts');
+
+// CORRECT - named profile
+revalidateTag('posts', 'max');
+
+// CORRECT - inline override
+revalidateTag('posts', { expire: 3600 });
+```
+
+The profile controls how the *next* fetch behaves. `'max'` means "this tag's cache is now permanent until the next revalidate."
+
+## `updateTag(tag)` - Server Actions only
+
+`updateTag` is `revalidateTag` plus an immediate refresh in the same response. Use it when the user just performed a write and expects to see their write reflected immediately.
+
+```typescript
+'use server';
+import { updateTag } from 'next/cache';
+
+export async function rename(id: string, name: string) {
+  await db.item.update({ where: { id }, data: { name } });
+  updateTag(`item-${id}`);
+  // The client gets the response with the cache updated;
+  // no extra revalidation request needed.
+}
+```
+
+Differences:
+
+- `revalidateTag(tag, profile)` - invalidates. The next request that hits the tag re-renders. Use for out-of-band changes (webhooks, background jobs).
+- `updateTag(tag)` - invalidates + refreshes in the current response. Use for user-initiated writes where the user wants to see the change immediately.
+
+## `refresh()` - uncached data refresh in Server Actions
+
+Server-side complement of `router.refresh()`. Refreshes uncached data in the current navigation tree without touching the cache layer.
+
+> `refresh()` was added in v16. The export module has shifted between RCs (some early RCs exposed it from `next/cache`, later releases from `next/navigation`). Check your installed `node_modules/next/index.d.ts` before importing - the symbol is the same.
+
+```typescript
+'use server';
+import { refresh } from 'next/navigation'; // VERIFY against your installed types
+
+export async function clearFilters() {
+  // No cache to bust - the page reads URL params and dynamic data
+  refresh();
+}
+```
+
+## `revalidatePath(path)` - the old standby
+
+Still supported. Path-scoped invalidation. Less precise than tags but useful when "everything under /dashboard needs to refresh" is the right shape.
+
+```typescript
+import { revalidatePath } from 'next/cache';
+
+revalidatePath('/dashboard');           // exact match
+revalidatePath('/blog/[slug]', 'page'); // dynamic, all instances
+revalidatePath('/', 'layout');          // root layout + every page under it
+```
+
+## Decision tree
+
+```
+Is this data per-user / per-request?
+├── YES → don't cache. Read fresh on every render.
+└── NO  → Is this data slow to compute or fetch?
+         ├── YES → Cache with 'use cache' + cacheLife + cacheTag.
+         │        How to bust:
+         │         - mutation in this app → updateTag (or revalidateTag) from the action
+         │         - webhook / cron       → revalidateTag from the route handler
+         │         - schedule-driven      → cacheLife with appropriate revalidate window
+         └── NO  → don't cache. Caching adds complexity without payoff.
+```
+
+## What NOT to cache
+
+- **Per-user data without a per-user cache key.** Two users hit the same cache entry, one sees the other's data. If you cache user-scoped data, the function's arguments must include the user ID and `cacheTag` must be user-scoped (`cacheTag(\`posts-user-${userId}\`)`).
+- **Anything you read from `cookies()` / `headers()`.** These signal request-scope. The compiler will mark the function dynamic and reject the `'use cache'` directive.
+- **Secrets.** Cached output is keyed and stored - never put session tokens or PII in a cached value.
+- **Server Action return values.** Actions are inherently mutating. Cache the read side, not the write side.
+
+## Migrating from v15
+
+```typescript
+// v15 with experimental.dynamicIO + experimental.useCache flags
+// next.config.ts
+const config = {
+  experimental: {
+    dynamicIO: true,
+    useCache: true,
+    ppr: true,
+  },
+};
+
+// route file with route-level PPR
+export const experimental_ppr = true;
+```
+
+```typescript
+// v16 - all collapsed
+// next.config.ts
+const config = {
+  cacheComponents: true,
+};
+
+// route file - no per-route flag needed, PPR runs as an internal mechanism
+```
+
+### `unstable_cache` migration
+
+```typescript
+// v15
+import { unstable_cache } from 'next/cache';
+
+export const getProducts = unstable_cache(
+  async () => db.product.findMany(),
+  ['products'],
+  { revalidate: 3600, tags: ['products'] }
+);
+
+// v16 - use the 'use cache' directive
+import { cacheLife, cacheTag } from 'next/cache';
+
+export async function getProducts() {
+  'use cache';
+  cacheLife('hours');
+  cacheTag('products');
+  return db.product.findMany();
+}
+```
+
+### `fetch` cache options migration
+
+```typescript
+// v15
+const res = await fetch('https://api.example.com/data', {
+  next: { revalidate: 3600, tags: ['data'] },
+});
+
+// v16 - the fetch-level options still work, but the 'use cache' wrapper is cleaner
+async function getData() {
+  'use cache';
+  cacheLife('hours');
+  cacheTag('data');
+  const res = await fetch('https://api.example.com/data');
+  return res.json();
+}
+```
+
+## Common mistakes
+
+- **`cacheTag` outside a `'use cache'` block.** Throws. The tag is a property of a cached function.
+- **`'use cache'` in a Client Component.** Cache Components is a server-only feature. The directive is silently ignored on the client.
+- **Tagging the read but forgetting to invalidate on write.** UI shows stale data. Add `revalidateTag` or `updateTag` to every mutation that affects this read.
+- **Tagging the write but not the read.** Invalidation has no effect because nothing was cached. Tags must appear on both sides.
+- **`cacheLife('hours')` on user-specific data without a user-scoped cache key.** First user's data is served to everyone. Either don't cache or include the user ID in the function arguments.
+- **Calling `revalidateTag('foo')` (single-arg) in v16.** TypeScript error. Pass a profile.
+- **`updateTag` in a Route Handler.** Server Actions only. Use `revalidateTag` from a Route Handler.

@@ -1,25 +1,21 @@
-import { revalidateTag } from 'next/cache';
+// Gold-standard Next.js 16 Route Handler. Demonstrates:
+// 1. Async params via RouteContext type
+// 2. Auth check via the DAL (not trusting headers from the client)
+// 3. DTO response (no raw DB rows)
+// 4. Public-API shape for external clients (mobile, webhooks)
+//    - if this data is for your own Server Components, call the DAL directly instead
+import { NextResponse } from "next/server";
+import { requireSession } from "@/lib/dal";
 
-// Correct: params typed as Promise, explicit caching
-export async function GET(request: Request) {
-  const { searchParams } = new URL(request.url);
-  const page = searchParams.get('page') || '1';
-  const limit = searchParams.get('limit') || '20';
+type UserDTO = { id: string; name: string };
 
-  const users = await fetch(
-    `https://api.example.com/users?page=${page}&limit=${limit}`,
-    { next: { revalidate: 60, tags: ['users'] } },
-  ).then(r => r.json());
-
-  return Response.json(users);
-}
-
-// Correct: mutation with revalidation
-export async function POST(request: Request) {
-  const body = await request.json();
-  const user = await db.user.create({ data: body });
-
-  revalidateTag('users');
-
-  return Response.json(user, { status: 201 });
+export async function GET() {
+  try {
+    const session = await requireSession();
+    // Return a minimal DTO. Never raw DB rows.
+    const dto: UserDTO = { id: session.userId, name: "Alice" };
+    return NextResponse.json(dto);
+  } catch (e) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
 }

@@ -1,16 +1,18 @@
-import { cookies } from 'next/headers';
+// Anti-pattern sample. DO NOT use as a template.
+// Violations:
+// 1. Trusts the layout's auth check (no re-verification in the page; partial-render bypass)
+// 2. Returns raw DB rows directly into the rendered tree (no DTO shaping)
+// 3. Component is not async despite awaiting data (would compile but the synchronous
+//    return type forbids top-level await)
 
-// Anti-pattern: params as sync object (must be Promise in 15)
-export default function DashboardPage({
-  params,
-  searchParams,
-}: {
-  params: { tab: string };         // Anti-pattern: not Promise
-  searchParams: { filter: string }; // Anti-pattern: not Promise
-}) {
-  // Anti-pattern: sync cookies (must await in 15)
-  const cookieStore = cookies();
-  const token = cookieStore.get('auth');
+import { db } from '@/lib/db';
 
-  return <div>Dashboard: {params.tab}, filter: {searchParams.filter}</div>;
+export default async function DashboardPage() {
+  const allUsers = await db.user.findMany();
+  return (
+    <div>
+      <h1>Dashboard</h1>
+      <pre>{JSON.stringify(allUsers, null, 2)}</pre>
+    </div>
+  );
 }

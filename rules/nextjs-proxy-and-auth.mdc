@@ -1,0 +1,399 @@
+---
+description: "Next.js 16 proxy.ts (renamed from middleware.ts) plus the three-layer auth model Vercel officially recommends. proxy.ts runs on Node.js runtime only and does OPTIMISTIC redirects; never the security boundary. DAL with cache()-wrapped verifySession does the SECURE check. Server Components, Server Actions, and Route Handlers re-verify at the data layer. Cookie discipline (httpOnly, secure, sameSite='lax', set on server only). Auth.js v5 / Clerk / Better Auth / WorkOS / Stack Auth / Supabase / Stytch shapes. Why React Context for auth doesn't work in Server Components. taintUniqueValue for exposing session info safely."
+globs: ["**/proxy.ts", "**/middleware.ts", "**/auth/**/*.ts", "**/lib/auth/**/*.ts"]
+---
+
+# proxy.ts and Auth
+
+`proxy.ts` (v16+) sits at the edge of your app and runs on every matching request. It is the right place for OPTIMISTIC checks (read a session cookie, redirect unauthenticated traffic away from `/dashboard/*`). It is the WRONG place for the security boundary.
+
+This rule covers the file shape, the three-layer auth model Vercel recommends, and the LLM-trap patterns around proxy / context / cookies.
+
+## `middleware.ts` -> `proxy.ts` (v16+)
+
+The file was renamed and the exported function name changed.
+
+```typescript
+// BAD (new code, v16) - middleware.ts is deprecated
+// middleware.ts
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+export function middleware(req: NextRequest) {
+  return NextResponse.next();
+}
+
+// CORRECT - proxy.ts
+// proxy.ts (at the project root, same place middleware.ts lived)
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+export function proxy(req: NextRequest) {
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: [
+    // Apply to everything EXCEPT next-internal, static assets, the favicon
+    '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:png|jpg|jpeg|svg|webp|css|js)$).*)',
+  ],
+};
+```
+
+Key v16 deltas:
+
+- File name: `middleware.ts` -> `proxy.ts`
+- Function name: `middleware` -> `proxy`
+- Runtime: `proxy.ts` runs on Node.js runtime only. The Edge-only `middleware.ts` form still works for the legacy Edge case but is deprecated.
+- Config flag: `skipMiddlewareUrlNormalize` -> `skipProxyUrlNormalize`
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next';
+
+const config: NextConfig = {
+  // v15
+  // skipMiddlewareUrlNormalize: true,
+
+  // v16
+  skipProxyUrlNormalize: true,
+};
+
+export default config;
+```
+
+## The matcher
+
+`config.matcher` accepts a string, array of strings, or array of objects. Patterns use the path-to-regexp syntax familiar from Express.
+
+```typescript
+export const config = {
+  matcher: [
+    '/dashboard/:path*',
+    '/admin/:path*',
+    {
+      source: '/api/:path*',
+      missing: [{ type: 'header', key: 'x-internal' }],
+    },
+  ],
+};
+```
+
+A request that does not match the config is never run through `proxy.ts` at all.
+
+## The three-layer auth model
+
+This is Vercel's officially documented pattern. Each layer has a single job; together they are defense in depth.
+
+```
+Layer 1: proxy.ts          OPTIMISTIC check (read cookie, early redirect)
+                          - Reads cookie value only, never hits the DB
+                          - Runs on prefetched routes too; cannot be trusted
+                          - Purpose: avoid sending unauthenticated traffic
+                            deeper into the app
+
+Layer 2: DAL verifySession  SECURE check (hits session store)
+                          - cache()-wrapped, runs once per render pass
+                          - Verifies the cookie token against the DB / KV
+                          - Returns a typed Session or null
+
+Layer 3: Component + Action  Always re-verify inside DAL functions and
+                            inside every Server Action
+                          - Defense in depth at the data layer
+```
+
+> Rule: never trust proxy.ts. Always re-verify in the DAL.
+
+## Layer 1: proxy.ts (optimistic only)
+
+```typescript
+// proxy.ts
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+const PROTECTED_PREFIXES = ['/dashboard', '/admin', '/settings'];
+const PUBLIC_AUTH_ROUTES = ['/login', '/signup'];
+
+export function proxy(req: NextRequest) {
+  const { pathname } = req.nextUrl;
+  const sessionCookie = req.cookies.get('session')?.value;
+
+  // OPTIMISTIC: just looks at cookie presence. Does NOT verify the token.
+  const looksAuthenticated = Boolean(sessionCookie);
+
+  // Redirect unauthenticated traffic away from protected routes
+  if (PROTECTED_PREFIXES.some(p => pathname.startsWith(p)) && !looksAuthenticated) {
+    const url = req.nextUrl.clone();
+    url.pathname = '/login';
+    url.searchParams.set('next', pathname);
+    return NextResponse.redirect(url);
+  }
+
+  // Redirect authenticated traffic away from login / signup
+  if (PUBLIC_AUTH_ROUTES.includes(pathname) && looksAuthenticated) {
+    const url = req.nextUrl.clone();
+    url.pathname = '/dashboard';
+    return NextResponse.redirect(url);
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: [
+    '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:png|jpg|jpeg|svg|webp)$).*)',
+  ],
+};
+```
+
+What this does and does not do:
+
+- DOES: redirect cheaply when the cookie is missing entirely.
+- DOES: redirect already-signed-in users away from the login page.
+- DOES NOT: validate the cookie. A forged cookie passes this check.
+- DOES NOT: hit the database. A DB call in `proxy.ts` runs on every request including prefetches.
+- DOES NOT: protect the action endpoints. A direct POST to an action ID bypasses `proxy.ts` entirely.
+
+## Layer 2: DAL `verifySession` (secure)
+
+```typescript
+// lib/dal/index.ts
+import 'server-only';
+import { cache } from 'react';
+import { cookies } from 'next/headers';
+import { db } from '@/lib/db';
+
+export type Session = {
+  userId: string;
+  role: 'user' | 'admin';
+  expiresAt: Date;
+};
+
+export const verifySession = cache(async (): Promise<Session | null> => {
+  const cookieStore = await cookies();
+  const token = cookieStore.get('session')?.value;
+  if (!token) return null;
+
+  const session = await db.session.findUnique({
+    where: { token },
+    select: { userId: true, role: true, expiresAt: true },
+  });
+  if (!session) return null;
+  if (session.expiresAt < new Date()) return null;
+  return session;
+});
+```
+
+See `nextjs-data-access-layer` for the full pattern.
+
+## Layer 3: re-verify in every consumer
+
+```typescript
+// Server Component
+export default async function DashboardPage() {
+  const session = await verifySession();
+  if (!session) redirect('/login');
+  // ...
+}
+```
+
+```typescript
+// Server Action
+'use server';
+export async function deletePost(id: string) {
+  const session = await verifySession();
+  if (!session) throw new Error('Unauthorized');
+  // ... resource ownership check, then mutation
+}
+```
+
+```typescript
+// Route Handler
+export async function POST(req: Request) {
+  const session = await verifySession();
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  // ...
+}
+```
+
+## Why `proxy.ts` is NEVER the security boundary
+
+Three specific reasons LLMs trip over:
+
+1. **`proxy.ts` runs on prefetched routes.** Next.js prefetches `<Link>` targets in the background. The prefetch goes through `proxy.ts` too. Doing real authorization work in `proxy.ts` causes either (a) wasted database calls on every prefetch or (b) auth state being asserted for routes the user never actually visited.
+
+2. **Server Actions have addressable POST endpoints.** Every Server Action gets an encrypted ID. An attacker who scrapes the ID from the network tab can POST directly to your app. That POST might match `proxy.ts`'s matcher or might not - and even when it does, `proxy.ts` cannot inspect which action is being invoked or what resource it touches.
+
+3. **Route Handlers and direct fetches.** External callers (webhooks, mobile clients, internal services) hit Route Handlers directly. If the Route Handler trusts a header set by `proxy.ts`, anyone can forge that header on a request that bypasses the matcher.
+
+The fix is the same in all three cases: re-verify at the data layer. `verifySession` inside the DAL function, inside the action, inside the route handler. The cookie-check in `proxy.ts` exists purely to avoid the wasted work of rendering an unauthenticated dashboard.
+
+## Cookie discipline
+
+Session cookies live on the SERVER. Set them in a Server Action, a Route Handler, or `proxy.ts`. Never `document.cookie =` from the client.
+
+```typescript
+// BAD - client-side cookie set
+'use client';
+function signIn() {
+  document.cookie = `session=${token}; path=/`;
+}
+
+// CORRECT - server-side cookie set inside a Server Action
+'use server';
+import { cookies } from 'next/headers';
+
+export async function signIn(_prev: State, formData: FormData) {
+  // ... validate credentials, mint session token
+
+  const cookieStore = await cookies();
+  cookieStore.set('session', token, {
+    httpOnly: true,         // not readable from JS - blocks XSS exfiltration
+    secure: true,           // HTTPS only
+    sameSite: 'lax',        // mitigates CSRF; 'strict' for higher-stakes apps
+    path: '/',
+    expires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+  });
+
+  redirect('/dashboard');
+}
+```
+
+Cookie flag rationale:
+
+- `httpOnly: true` - the cookie is invisible to `document.cookie`. An XSS payload cannot exfiltrate it.
+- `secure: true` - the browser only sends the cookie over HTTPS. Mandatory in production.
+- `sameSite: 'lax'` - default for most apps. Browser sends the cookie on top-level navigation but not on cross-site POSTs. Use `'strict'` if you do not need cross-site GETs (e.g. payment links).
+- `path: '/'` - cookie scoped to the whole app. Narrow this only if you have a specific reason.
+
+Setting cookies is forbidden during render. The setter only works in a Server Action, Route Handler, or `proxy.ts`.
+
+```typescript
+// BAD - throws "Cookies can only be modified in a Server Action or Route Handler"
+export default async function Page() {
+  const cookieStore = await cookies();
+  cookieStore.set('seen', '1');  // forbidden during render
+  return <div />;
+}
+```
+
+## Auth.js v5 (NextAuth) shape
+
+Auth.js v5 (formerly NextAuth) is the most common auth library in the Next.js ecosystem. The v5 export shape:
+
+```typescript
+// lib/auth.ts
+import NextAuth from 'next-auth';
+import GitHub from 'next-auth/providers/github';
+
+export const { auth, signIn, signOut, handlers } = NextAuth({
+  providers: [GitHub],
+  session: { strategy: 'jwt' },
+});
+```
+
+Then in Server Components and actions:
+
+```typescript
+import { auth } from '@/lib/auth';
+
+export default async function Page() {
+  const session = await auth();
+  if (!session) redirect('/login');
+  return <div>Hi {session.user.name}</div>;
+}
+```
+
+In a Route Handler:
+
+```typescript
+// app/api/auth/[...nextauth]/route.ts
+import { handlers } from '@/lib/auth';
+export const { GET, POST } = handlers;
+```
+
+Auth.js v5 wires into `proxy.ts` via `auth` as a wrapper - but the same rule applies: the wrapper does the cookie check optimistically. Re-verify in the DAL.
+
+## Other auth library options
+
+All function as Vercel-equivalent alternatives. Verify against your installed version's docs for the exact shape:
+
+- **Clerk** - hosted auth + UI components, generous free tier
+- **Better Auth** - self-hosted, framework-agnostic, growing community
+- **WorkOS** - enterprise SSO, SAML, SCIM
+- **Stack Auth** - open source, full-stack
+- **Supabase Auth** - bundled with Supabase DB, JWT-based
+- **Stytch** - passwordless / OTP focus
+
+The integration pattern is the same in each: a server-side `verifySession`-equivalent in the DAL, optimistic redirects in `proxy.ts`, re-verification in every action.
+
+## React Context does NOT work for auth in Server Components
+
+A `<SessionProvider value={...}>` that wraps a Server Component child does NOT propagate the context to that child. Server Components have no React Context runtime.
+
+```typescript
+// BAD - context never reaches the Server Component child
+'use client';
+const SessionContext = createContext<Session | null>(null);
+export function SessionProvider({ value, children }: Props) {
+  return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
+}
+
+// Somewhere:
+<SessionProvider value={session}>
+  <ServerDashboard /> {/* renders WITHOUT context, gets null */}
+</SessionProvider>
+```
+
+```typescript
+// CORRECT - read session at the server component itself
+import { verifySession } from '@/lib/dal';
+
+export default async function ServerDashboard() {
+  const session = await verifySession();
+  if (!session) redirect('/login');
+  return <Dashboard userId={session.userId} />;
+}
+```
+
+For Client Components that need session info, pass the minimum necessary fields down as props from a Server Component, or use a Client-side context whose provider only wraps Client Components.
+
+## `taintUniqueValue` for safe session exposure
+
+If you must hand session info to a Client Component, hand only what is safe - and taint the original so an accidental leak throws.
+
+```typescript
+// lib/dal/index.ts
+import 'server-only';
+import { experimental_taintUniqueValue as taintUniqueValue } from 'react';
+
+export const verifySession = cache(async () => {
+  // ... fetch session
+  const session = { userId, role, expiresAt, token };
+
+  // Taint the token so it can never reach a Client Component
+  taintUniqueValue(
+    'Do not pass the session token to the client',
+    session,
+    session.token
+  );
+
+  return session;
+});
+```
+
+If `session.token` ever lands in a Client Component prop, React throws. The `userId` and `role` fields are safe to pass.
+
+`taintUniqueValue` is gated behind the `experimental.taint` flag. Verify against your installed version's changelog before adopting.
+
+## Common mistakes
+
+- **Trusting `proxy.ts` as the security boundary.** It runs on prefetches; it cannot inspect action IDs; a direct POST bypasses it. Always re-verify in the DAL.
+- **No `verifySession` re-check inside a Server Action.** Page-level auth does not extend to the action. Actions are addressable POST endpoints.
+- **Hitting the database inside `proxy.ts`.** Runs on every prefetched route. Either drop the DB call or move the check to the DAL.
+- **Redirecting from `proxy.ts` for cases that belong in the Server Component.** If the redirect depends on user state more nuanced than "has a session cookie," do it server-side.
+- **React Context for session in Server Components.** Providers do not propagate to Server children. Read session from the DAL on the server.
+- **Setting cookies on the client.** Use a Server Action or Route Handler. Mark cookies `httpOnly: true, secure: true, sameSite: 'lax'`.
+- **`cookies().set(...)` during render.** Forbidden. Only mutate cookies in a Server Action, Route Handler, or `proxy.ts`.
+- **Forgetting the `skipMiddlewareUrlNormalize` -> `skipProxyUrlNormalize` rename.** The v15 flag silently does nothing in v16.
+- **Keeping `middleware.ts` for new v16 code.** The Edge-runtime `middleware.ts` still works but is deprecated. Default to `proxy.ts`.

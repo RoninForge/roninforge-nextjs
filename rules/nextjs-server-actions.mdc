@@ -1,0 +1,394 @@
+---
+description: "Next.js 16 Server Actions: 'use server' placement (file-level vs function-level), Zod input validation, useActionState (replaces useFormState) + useFormStatus pairing, redirect() OUTSIDE try/catch (it throws), revalidateTag / updateTag / refresh after mutations, DTO return values (never raw DB rows), authorization re-checks (page-level auth does NOT cover the action), rate limiting, the next-safe-action / zsa pattern, Server Action encryption + allowedOrigins config."
+globs: ["**/actions.ts", "**/actions/**/*.ts", "**/_actions/**/*.ts"]
+---
+
+# Server Actions
+
+Server Actions are async functions that run on the server, invokable from Client Components via `<form action={action}>` or `formAction={action}`, or via direct call when wired through `useActionState`. Under the hood each action is an addressable POST endpoint - this is what makes the authorization rules below load-bearing.
+
+## `'use server'` placement
+
+Two forms. Pick the one that matches the file's purpose.
+
+**File-level** (preferred for an actions module):
+
+```typescript
+// app/posts/actions.ts
+'use server';
+
+export async function createPost(/* ... */) { /* ... */ }
+export async function deletePost(/* ... */) { /* ... */ }
+```
+
+**Function-level** (when actions live alongside non-action exports):
+
+```typescript
+// lib/helpers.ts
+import { db } from './db';
+
+export function formatPostTitle(title: string) { /* ... */ } // not an action
+
+export async function publishPost(id: string) {
+  'use server'; // <-- ONLY this function is a Server Action
+  // ...
+}
+```
+
+A file-level `'use server'` makes every export an action - including `default` exports. If you export a non-action helper from the same file, switch to function-level `'use server'` on each action.
+
+## The canonical action shape
+
+Every Server Action that handles user input should do five things in order:
+
+1. **Authorize** - re-verify the session inside the action.
+2. **Validate** - parse `FormData` with Zod (or Valibot, or similar).
+3. **Authorize the resource** - check the user owns the thing they're acting on.
+4. **Mutate** - do the database write inside a try/catch that returns errors as state.
+5. **Revalidate / redirect** - bust caches and (optionally) redirect OUTSIDE the try/catch.
+
+```typescript
+// app/posts/actions.ts
+'use server';
+
+import { z } from 'zod';
+import { revalidateTag } from 'next/cache';
+import { redirect } from 'next/navigation';
+import { verifySession } from '@/lib/dal';
+import { db } from '@/lib/db';
+
+const CreatePostSchema = z.object({
+  title: z.string().min(1).max(200),
+  body: z.string().min(1).max(50_000),
+});
+
+type State = { errors?: Record<string, string[]>; ok?: boolean };
+
+export async function createPost(_prev: State, formData: FormData): Promise<State> {
+  // 1. Authorize
+  const session = await verifySession();
+  if (!session) return { errors: { _form: ['Sign in to post'] } };
+
+  // 2. Validate
+  const parsed = CreatePostSchema.safeParse({
+    title: formData.get('title'),
+    body: formData.get('body'),
+  });
+  if (!parsed.success) {
+    return { errors: parsed.error.flatten().fieldErrors };
+  }
+
+  // 3. (no resource ownership to check for create; for update/delete see below)
+
+  // 4. Mutate
+  try {
+    await db.post.create({
+      data: { ...parsed.data, authorId: session.userId },
+    });
+  } catch (e) {
+    return { errors: { _form: ['Failed to save'] } };
+  }
+
+  // 5. Revalidate, then redirect OUTSIDE the try/catch
+  revalidateTag('posts', 'max');
+  redirect('/posts');
+}
+```
+
+Update / delete adds resource ownership:
+
+```typescript
+'use server';
+
+export async function deletePost(_prev: State, formData: FormData): Promise<State> {
+  const session = await verifySession();
+  if (!session) return { errors: { _form: ['Sign in'] } };
+
+  const id = String(formData.get('id') ?? '');
+  if (!id) return { errors: { _form: ['Missing post id'] } };
+
+  // Resource ownership check - this is the IDOR guard
+  const post = await db.post.findUnique({ where: { id } });
+  if (!post) return { errors: { _form: ['Post not found'] } };
+  if (post.authorId !== session.userId) {
+    return { errors: { _form: ['Forbidden'] } };
+  }
+
+  await db.post.delete({ where: { id } });
+  revalidateTag('posts', 'max');
+  return { ok: true };
+}
+```
+
+## Why `redirect()` MUST be outside `try / catch`
+
+`redirect()` works by throwing a special `NEXT_REDIRECT` error that the framework catches at the boundary. A `try { ... redirect(); ... } catch (e) { ... }` intercepts that throw - the redirect silently dies.
+
+```typescript
+// WRONG - redirect swallowed
+try {
+  await db.post.create({ /* ... */ });
+  redirect('/posts');  // throws NEXT_REDIRECT
+} catch (e) {
+  console.error(e);    // logs the redirect error, nothing happens
+}
+
+// CORRECT - redirect runs after the try/catch returns
+try {
+  await db.post.create({ /* ... */ });
+} catch (e) {
+  return { errors: { _form: ['Failed to save'] } };
+}
+redirect('/posts');
+```
+
+If you must catch other errors and still allow redirect to propagate, structure the code so the redirect call is the LAST statement in the `try`, then re-throw any error whose message starts with `NEXT_REDIRECT`:
+
+```typescript
+try {
+  await db.post.create({ /* ... */ });
+  redirect('/posts');
+} catch (e) {
+  // Next.js signals redirect/notFound via thrown errors with these messages.
+  // Re-throwing lets the framework handle them. Don't import the internal
+  // isRedirectError helper - it lives under next/dist/* and is not a stable API.
+  if (e instanceof Error && /^NEXT_(REDIRECT|NOT_FOUND)$/.test(e.message)) {
+    throw e;
+  }
+  return { errors: { _form: ['Failed'] } };
+}
+```
+
+The simpler and recommended pattern is still: do not wrap `redirect()` in a try/catch at all. Put it outside the block.
+
+## Client side: `useActionState` + `useFormStatus`
+
+`useActionState` (React 19) replaces `useFormState`. Signature gained a third tuple element for pending state.
+
+```typescript
+// app/posts/create-form.tsx
+'use client';
+
+import { useActionState } from 'react';
+import { createPost } from './actions';
+import { SubmitButton } from './submit-button';
+
+const initial = {};
+
+export function CreatePostForm() {
+  const [state, formAction, pending] = useActionState(createPost, initial);
+  return (
+    <form action={formAction}>
+      <label>
+        Title
+        <input name="title" required />
+        {state.errors?.title && <p className="error">{state.errors.title[0]}</p>}
+      </label>
+      <label>
+        Body
+        <textarea name="body" required />
+        {state.errors?.body && <p className="error">{state.errors.body[0]}</p>}
+      </label>
+      {state.errors?._form && <p className="error">{state.errors._form[0]}</p>}
+      <SubmitButton />
+      {/* `pending` from useActionState is also available here */}
+    </form>
+  );
+}
+```
+
+`useFormStatus` (still from `react-dom`) gives a child component of a `<form>` access to its parent's pending state. Useful when the submit button is several levels down.
+
+```typescript
+// app/posts/submit-button.tsx
+'use client';
+
+import { useFormStatus } from 'react-dom';
+
+export function SubmitButton() {
+  const { pending } = useFormStatus();
+  return (
+    <button type="submit" disabled={pending}>
+      {pending ? 'Saving...' : 'Save'}
+    </button>
+  );
+}
+```
+
+`useFormStatus` returns `pending: boolean`, `data: FormData | null`, `method: 'get' | 'post'`, `action: ((formData: FormData) => void) | null`.
+
+## Why the action MUST re-authorize
+
+Server Actions are independent POST endpoints. An attacker can:
+
+- Inspect the action's encrypted ID from the network tab.
+- Construct a direct POST to your app with that ID and arbitrary form data.
+- Trigger the action even though the page that defined the form requires auth.
+
+Page-level auth (in `proxy.ts`, in a layout, in the calling Server Component) does NOT carry into the action. Always re-verify:
+
+```typescript
+'use server';
+
+export async function someAction(/* ... */) {
+  const session = await verifySession();
+  if (!session) throw new Error('Unauthorized'); // or return error state
+  // ... rest of action
+}
+```
+
+This is officially called out in Vercel's data-security guide.
+
+## Authorization ≠ Authentication: the IDOR guard
+
+Authenticating "the request has a valid session" is not enough. The action must also verify the user owns the resource they're acting on.
+
+```typescript
+'use server';
+
+// BAD - any authenticated user can delete any post
+export async function deletePost(id: string) {
+  const session = await verifySession();
+  if (!session) throw new Error('Unauthorized');
+  await db.post.delete({ where: { id } });
+}
+
+// CORRECT - verify ownership BEFORE the delete
+export async function deletePost(id: string) {
+  const session = await verifySession();
+  if (!session) throw new Error('Unauthorized');
+
+  const post = await db.post.findUnique({ where: { id } });
+  if (!post) throw new Error('Not found');
+  if (post.authorId !== session.userId) throw new Error('Forbidden');
+
+  await db.post.delete({ where: { id } });
+}
+```
+
+## Return values: DTOs only
+
+Action return values are serialized to the client. Never return raw DB records - you leak whatever columns the model has including soft-delete flags, audit timestamps, password hashes, internal IDs.
+
+```typescript
+// BAD - leaks the entire user row
+'use server';
+export async function updateProfile(/* ... */) {
+  const user = await db.user.update({ /* ... */ });
+  return user;
+}
+
+// CORRECT - explicit DTO
+'use server';
+type ProfileDTO = { id: string; name: string; avatarUrl: string | null };
+
+export async function updateProfile(/* ... */): Promise<ProfileDTO> {
+  const user = await db.user.update({ /* ... */ });
+  return { id: user.id, name: user.name, avatarUrl: user.avatarUrl };
+}
+```
+
+## Revalidation: tag-scoped over path-scoped
+
+After mutation, bust the cache. Three options:
+
+```typescript
+import { revalidateTag, updateTag, revalidatePath } from 'next/cache';
+
+// Option 1: tag-scoped, out-of-band invalidation
+//   Use when the user isn't waiting for the read to update inline.
+revalidateTag('posts', 'max');
+
+// Option 2: tag-scoped, read-your-writes
+//   Use when the user expects to see their write reflected immediately
+//   in the response of this same action.
+updateTag('posts');
+
+// Option 3: path-scoped (legacy but still useful)
+//   Use when many tags would change and a path-level bust is cleaner.
+revalidatePath('/dashboard');
+```
+
+See the dedicated `nextjs-cache-components` rule for the cache lifecycle.
+
+## Input validation: Zod is the path of least resistance
+
+```typescript
+'use server';
+import { z } from 'zod';
+
+const SignupSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(12).regex(/[A-Z]/).regex(/[0-9]/),
+});
+
+export async function signup(_prev: State, formData: FormData): Promise<State> {
+  const parsed = SignupSchema.safeParse({
+    email: formData.get('email'),
+    password: formData.get('password'),
+  });
+  if (!parsed.success) {
+    return { errors: parsed.error.flatten().fieldErrors };
+  }
+  // ... parsed.data is fully typed
+}
+```
+
+`next-safe-action` and `zsa` are popular wrappers that bake validation + auth + result types into one decorator. The underlying shape is the same.
+
+## Rate limiting
+
+Server Actions are reachable as POST endpoints. Anyone who scrapes the action ID can hammer it. Rate limit any action that:
+
+- Sends email
+- Writes to the database
+- Calls a paid third-party API
+- Is reachable by unauthenticated users (e.g. signup, contact form)
+
+```typescript
+'use server';
+import { Ratelimit } from '@upstash/ratelimit';
+import { Redis } from '@upstash/redis';
+import { headers } from 'next/headers';
+
+const ratelimit = new Ratelimit({
+  redis: Redis.fromEnv(),
+  limiter: Ratelimit.slidingWindow(5, '1 m'),
+});
+
+export async function contact(_prev: State, formData: FormData) {
+  const ip = (await headers()).get('x-forwarded-for')?.split(',')[0] ?? 'unknown';
+  const { success } = await ratelimit.limit(`contact:${ip}`);
+  if (!success) return { errors: { _form: ['Too many requests'] } };
+
+  // ... rest of action
+}
+```
+
+## Multi-host / proxy deployments
+
+If your app sits behind a reverse proxy or runs on multiple hosts, configure:
+
+```typescript
+// next.config.ts
+const config = {
+  serverActions: {
+    allowedOrigins: ['https://app.example.com', 'https://www.example.com'],
+  },
+};
+```
+
+For multi-server deployments, set `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` so every host can decrypt action closures. Without this, action invocations rotated to a different host fail with an encryption error.
+
+## Common mistakes
+
+- **`redirect()` inside try/catch** - silently swallowed. Move outside.
+- **No input validation** - actions are POST endpoints; trust nothing from `FormData`.
+- **Page-level auth assumed to cover the action** - it doesn't. Re-verify in the action.
+- **`useFormState` from `react-dom`** - deprecated. Use `useActionState` from `react`.
+- **Missing `useFormStatus` for submit-button pending** - user double-clicks, action runs twice.
+- **Returning raw DB rows** - PII / hash leak. Return a DTO.
+- **No revalidation after mutation** - UI shows stale data.
+- **Throwing on validation failure** - prevents `useActionState` from getting an error state. Return errors as state.
+- **`'use server'` at file level when the file has non-action exports** - the helpers become actions too. Use function-level `'use server'`.
+- **No rate limit on signup / contact / public actions** - free DoS vector.

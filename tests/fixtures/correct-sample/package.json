@@ -1,0 +1,24 @@
+{
+  "name": "correct-sample",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Gold-standard Next.js 16 sample. Modern App Router with DAL, Cache Components, proxy.ts, async APIs, Server Actions with validation + revalidation, redirect outside try/catch.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "^16.0.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "server-only": "^0.0.1",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.6.0"
+  }
+}
